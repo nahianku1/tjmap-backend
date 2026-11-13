@@ -1,12 +1,40 @@
-import { Injectable, NotFoundException } from '@nestjs/common';
+import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
 import { DatabaseService } from '../database/database.service';
-import { guardDuplicate } from '../database/pg-errors';
-import { CreateLinkDto, UpdateLinkDto } from './tj.dto';
+import { CreateLinkDto, LinkCoreDto, UpdateLinkDto } from './tj.dto';
+
+type EndpointKind = 'tj' | 'olt' | 'onu';
+
+interface Endpoint {
+  kind: EndpointKind;
+  id: string;
+  code: string;
+  name: string | null;
+  lat: number;
+  lng: number;
+}
+
+export interface LinkPathPoint {
+  lat: number;
+  lng: number;
+}
+
+export interface LinkCore {
+  index: number;
+  label: string;
+  color: string;
+  status: 'connected' | 'free';
+  fromCoreLabel: string | null;
+  toCoreLabel: string | null;
+}
 
 interface LinkRow {
   id: string;
-  from_tj_id: string;
-  to_tj_id: string;
+  from_tj_id: string | null;
+  from_olt_id: string | null;
+  from_onu_id: string | null;
+  to_tj_id: string | null;
+  to_olt_id: string | null;
+  to_onu_id: string | null;
   from_code: string;
   to_code: string;
   from_name: string | null;
@@ -18,6 +46,10 @@ interface LinkRow {
   fibre_id: string;
   cable_type: string | null;
   core_count: number;
+  from_core_label: string | null;
+  to_core_label: string | null;
+  cores: unknown;
+  path: unknown;
   status: string;
   length_m: number | null;
   notes: string | null;
@@ -25,19 +57,135 @@ interface LinkRow {
   updated_at: Date;
 }
 
+function normalisePath(raw: unknown): LinkPathPoint[] {
+  if (!Array.isArray(raw)) return [];
+  return raw.slice(0, 500).flatMap((item) => {
+    const point = (item ?? {}) as { lat?: unknown; lng?: unknown };
+    const lat = Number(point.lat);
+    const lng = Number(point.lng);
+    if (!Number.isFinite(lat) || !Number.isFinite(lng)) return [];
+    if (Math.abs(lat) > 90 || Math.abs(lng) > 180) return [];
+    return [{ lat, lng }];
+  });
+}
+
+function haversineMeters(lat1: number, lng1: number, lat2: number, lng2: number): number {
+  const radius = 6371000;
+  const toRad = (value: number) => (value * Math.PI) / 180;
+  const dLat = toRad(lat2 - lat1);
+  const dLng = toRad(lng2 - lng1);
+  const a =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLng / 2) ** 2;
+  return 2 * radius * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
+
+/** Length of the span through its drawn waypoints, or the straight line when none were drawn. */
+function routeLengthMeters(
+  fromLat: number,
+  fromLng: number,
+  toLat: number,
+  toLng: number,
+  path: LinkPathPoint[],
+): number {
+  const points = [
+    { lat: fromLat, lng: fromLng },
+    ...path,
+    { lat: toLat, lng: toLng },
+  ];
+  let total = 0;
+  for (let index = 1; index < points.length; index += 1) {
+    total += haversineMeters(
+      points[index - 1].lat,
+      points[index - 1].lng,
+      points[index].lat,
+      points[index].lng,
+    );
+  }
+  return total;
+}
+
+const CORE_COLORS = [
+  '#22d3ee',
+  '#a78bfa',
+  '#f472b6',
+  '#fbbf24',
+  '#34d399',
+  '#60a5fa',
+  '#fb7185',
+  '#c084fc',
+  '#4ade80',
+  '#facc15',
+  '#38bdf8',
+  '#f97316',
+];
+
 const LINK_SELECT = `
-  SELECT l.id, l.from_tj_id, l.to_tj_id,
-         f.code AS from_code, t.code AS to_code,
-         f.name AS from_name, t.name AS to_name,
-         ST_Y(f.location::geometry) AS from_lat,
-         ST_X(f.location::geometry) AS from_lng,
-         ST_Y(t.location::geometry) AS to_lat,
-         ST_X(t.location::geometry) AS to_lng,
-         l.fibre_id, l.cable_type, l.core_count, l.status, l.length_m, l.notes,
-         l.created_at, l.updated_at
+  SELECT l.id, l.from_tj_id, l.from_olt_id, l.from_onu_id,
+         l.to_tj_id, l.to_olt_id, l.to_onu_id,
+         COALESCE(f.code, fo.code, fu.username) AS from_code,
+         COALESCE(t.code, o.code, ou.username) AS to_code,
+         COALESCE(f.name, fo.name, fu.fibre_id) AS from_name,
+         COALESCE(t.name, o.name, ou.fibre_id) AS to_name,
+         ST_Y(COALESCE(f.location, fo.location, fu.location)::geometry) AS from_lat,
+         ST_X(COALESCE(f.location, fo.location, fu.location)::geometry) AS from_lng,
+         ST_Y(COALESCE(t.location, o.location, ou.location)::geometry) AS to_lat,
+         ST_X(COALESCE(t.location, o.location, ou.location)::geometry) AS to_lng,
+         l.fibre_id, l.cable_type, l.core_count, l.from_core_label, l.to_core_label,
+         l.cores, l.path, l.status, l.length_m, l.notes, l.created_at, l.updated_at
   FROM tj_links l
-  JOIN tjs f ON f.id = l.from_tj_id
-  JOIN tjs t ON t.id = l.to_tj_id`;
+  LEFT JOIN tjs f ON f.id = l.from_tj_id
+  LEFT JOIN olts fo ON fo.id = l.from_olt_id
+  LEFT JOIN onus fu ON fu.id = l.from_onu_id
+  LEFT JOIN tjs t ON t.id = l.to_tj_id
+  LEFT JOIN olts o ON o.id = l.to_olt_id
+  LEFT JOIN onus ou ON ou.id = l.to_onu_id`;
+
+function normaliseCores(
+  raw: LinkCoreDto[] | undefined,
+  count: number,
+  legacyFrom?: string | null,
+  legacyTo?: string | null,
+): LinkCore[] {
+  const source: LinkCoreDto[] =
+    raw && raw.length > 0
+      ? raw
+      : Array.from({ length: Math.max(0, Math.min(count, 288)) }, (_value, index) => ({
+          index: index + 1,
+          label: `Core ${index + 1}`,
+          color: CORE_COLORS[index % CORE_COLORS.length],
+          fromCoreLabel: index === 0 ? legacyFrom ?? null : null,
+          toCoreLabel: index === 0 ? legacyTo ?? null : null,
+        }));
+
+  return source.slice(0, 288).map((row, index) => {
+    const fromCoreLabel = row.fromCoreLabel?.trim() || null;
+    const toCoreLabel = row.toCoreLabel?.trim() || null;
+    return {
+      index: row.index ?? index + 1,
+      label: row.label?.trim() || `Core ${index + 1}`,
+      color: row.color ?? CORE_COLORS[index % CORE_COLORS.length],
+      fromCoreLabel,
+      toCoreLabel,
+      status: fromCoreLabel && toCoreLabel ? 'connected' : 'free',
+    };
+  });
+}
+
+function parseStoredCores(value: unknown): LinkCore[] {
+  if (!Array.isArray(value)) return [];
+  return value.map((item, index) => {
+    const entry = (item ?? {}) as Partial<LinkCore>;
+    return {
+      index: Number(entry.index ?? index + 1),
+      label: entry.label ?? `Core ${index + 1}`,
+      color: entry.color ?? CORE_COLORS[index % CORE_COLORS.length],
+      status: entry.status === 'connected' ? 'connected' : 'free',
+      fromCoreLabel: entry.fromCoreLabel ?? null,
+      toCoreLabel: entry.toCoreLabel ?? null,
+    };
+  });
+}
 
 @Injectable()
 export class LinkService {
@@ -48,100 +196,324 @@ export class LinkService {
     return rows.map((row) => this.mapLink(row));
   }
 
+  async get(id: string) {
+    const rows = await this.db.query<LinkRow>(`${LINK_SELECT} WHERE l.id = $1`, [id]);
+    if (rows.length === 0) throw new NotFoundException('Fibre link not found');
+    return this.mapLink(rows[0]);
+  }
+
   async create(dto: CreateLinkDto, userId: string) {
-    const rows = await guardDuplicate(
-      this.db.query<LinkRow>(
-      `WITH inserted AS (
-         INSERT INTO tj_links (from_tj_id, to_tj_id, fibre_id, cable_type, core_count, status, notes, created_by, length_m)
-         SELECT $1, $2, $3, $4, $5, $6, $7, $8, ST_Distance(f.location, t.location)
-         FROM tjs f, tjs t
-         WHERE f.id = $1 AND t.id = $2
-         RETURNING *
-       )
-       SELECT l.id, l.from_tj_id, l.to_tj_id,
-              f.code AS from_code, t.code AS to_code,
-              f.name AS from_name, t.name AS to_name,
-              ST_Y(f.location::geometry) AS from_lat,
-              ST_X(f.location::geometry) AS from_lng,
-              ST_Y(t.location::geometry) AS to_lat,
-              ST_X(t.location::geometry) AS to_lng,
-              l.fibre_id, l.cable_type, l.core_count, l.status, l.length_m, l.notes,
-              l.created_at, l.updated_at
-       FROM inserted l
-       JOIN tjs f ON f.id = l.from_tj_id
-       JOIN tjs t ON t.id = l.to_tj_id`,
+    const from = await this.resolveEndpoint(dto.fromTjId, dto.fromOltId, dto.fromOnuId, 'from');
+    const to = await this.resolveEndpoint(dto.toTjId, dto.toOltId, dto.toOnuId, 'to');
+    this.assertDistinct(from, to);
+    await this.assertNotLinked(from, to);
+
+    const cores = normaliseCores(dto.cores, dto.coreCount ?? dto.cores?.length ?? 0, dto.fromCoreLabel, dto.toCoreLabel);
+    const primaryFrom = cores.find((core) => core.fromCoreLabel)?.fromCoreLabel ?? null;
+    const primaryTo = cores.find((core) => core.toCoreLabel)?.toCoreLabel ?? null;
+    const path = normalisePath(dto.path);
+    const lengthM = routeLengthMeters(from.lat, from.lng, to.lat, to.lng, path);
+
+    const rows = await this.db.query<{ id: string }>(
+      `INSERT INTO tj_links (from_tj_id, from_olt_id, from_onu_id,
+                             to_tj_id, to_olt_id, to_onu_id,
+                             fibre_id, cable_type, core_count, from_core_label, to_core_label,
+                             cores, status, notes, created_by, path, length_m)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::jsonb, $13, $14, $15,
+               $16::jsonb, $17)
+       RETURNING id`,
       [
-        dto.fromTjId,
-        dto.toTjId,
+        from.kind === 'tj' ? from.id : null,
+        from.kind === 'olt' ? from.id : null,
+        from.kind === 'onu' ? from.id : null,
+        to.kind === 'tj' ? to.id : null,
+        to.kind === 'olt' ? to.id : null,
+        to.kind === 'onu' ? to.id : null,
         dto.fibreId.trim(),
         dto.cableType?.trim() || null,
-        dto.coreCount,
+        cores.length,
+        primaryFrom,
+        primaryTo,
+        JSON.stringify(cores),
         dto.status ?? 'active',
         dto.notes?.trim() || null,
         userId,
+        JSON.stringify(path),
+        lengthM,
       ],
-    ),
-      'These two joints are already linked. Edit the existing span instead.',
     );
 
-    if (rows.length === 0) {
-      throw new NotFoundException('One or both terminal joints no longer exist');
-    }
-    return this.mapLink(rows[0]);
+    await this.syncDeviceCores(rows[0].id, from, cores.map((core) => core.fromCoreLabel));
+    await this.syncDeviceCores(rows[0].id, to, cores.map((core) => core.toCoreLabel));
+    await this.syncOnuCores(rows[0].id, from, cores.map((core) => core.fromCoreLabel));
+    await this.syncOnuCores(rows[0].id, to, cores.map((core) => core.toCoreLabel));
+    return this.get(rows[0].id);
   }
 
   async update(id: string, dto: UpdateLinkDto) {
-    const current = await this.db.query<{
-      fibre_id: string;
-      cable_type: string | null;
-      core_count: number;
-      status: string;
-      notes: string | null;
-    }>('SELECT fibre_id, cable_type, core_count, status, notes FROM tj_links WHERE id = $1', [id]);
+    const current = await this.db.query<LinkRow>(`${LINK_SELECT} WHERE l.id = $1`, [id]);
     if (current.length === 0) throw new NotFoundException('Fibre link not found');
+    const row = current[0];
+    const from = await this.endpointForRow(row, 'from');
+    const to = await this.endpointForRow(row, 'to');
 
-    const rows = await this.db.query<LinkRow>(
-      `WITH updated AS (
-         UPDATE tj_links SET
-           fibre_id = $2, cable_type = $3, core_count = $4, status = $5, notes = $6, updated_at = now()
-         WHERE id = $1
-         RETURNING *
-       )
-       SELECT l.id, l.from_tj_id, l.to_tj_id,
-              f.code AS from_code, t.code AS to_code,
-              f.name AS from_name, t.name AS to_name,
-              ST_Y(f.location::geometry) AS from_lat,
-              ST_X(f.location::geometry) AS from_lng,
-              ST_Y(t.location::geometry) AS to_lat,
-              ST_X(t.location::geometry) AS to_lng,
-              l.fibre_id, l.cable_type, l.core_count, l.status, l.length_m, l.notes,
-              l.created_at, l.updated_at
-       FROM updated l
-       JOIN tjs f ON f.id = l.from_tj_id
-       JOIN tjs t ON t.id = l.to_tj_id`,
+    const cores =
+      dto.cores !== undefined || dto.coreCount !== undefined
+        ? normaliseCores(
+            dto.cores,
+            dto.coreCount ?? row.core_count,
+            row.from_core_label,
+            row.to_core_label,
+          )
+        : parseStoredCores(row.cores);
+
+    const path = dto.path !== undefined ? normalisePath(dto.path) : normalisePath(row.path);
+    const lengthM = routeLengthMeters(from.lat, from.lng, to.lat, to.lng, path);
+
+    await this.db.query(
+      `UPDATE tj_links SET
+         fibre_id = $2,
+         cable_type = $3,
+         core_count = $4,
+         from_core_label = $5,
+         to_core_label = $6,
+         cores = $7::jsonb,
+         status = $8,
+         notes = $9,
+         path = $10::jsonb,
+         length_m = $11,
+         updated_at = now()
+       WHERE id = $1`,
       [
         id,
-        dto.fibreId?.trim() ?? current[0].fibre_id,
-        dto.cableType !== undefined ? dto.cableType?.trim() || null : current[0].cable_type,
-        dto.coreCount ?? current[0].core_count,
-        dto.status ?? current[0].status,
-        dto.notes !== undefined ? dto.notes?.trim() || null : current[0].notes,
+        dto.fibreId?.trim() ?? row.fibre_id,
+        dto.cableType !== undefined ? dto.cableType?.trim() || null : row.cable_type,
+        cores.length,
+        cores.find((core) => core.fromCoreLabel)?.fromCoreLabel ?? null,
+        cores.find((core) => core.toCoreLabel)?.toCoreLabel ?? null,
+        JSON.stringify(cores),
+        dto.status ?? row.status,
+        dto.notes !== undefined ? dto.notes?.trim() || null : row.notes,
+        JSON.stringify(path),
+        lengthM,
       ],
     );
-    return this.mapLink(rows[0]);
+
+    await this.syncDeviceCores(id, from, cores.map((core) => core.fromCoreLabel));
+    await this.syncDeviceCores(id, to, cores.map((core) => core.toCoreLabel));
+    await this.syncOnuCores(id, from, cores.map((core) => core.fromCoreLabel));
+    await this.syncOnuCores(id, to, cores.map((core) => core.toCoreLabel));
+    return this.get(id);
   }
 
   async remove(id: string) {
-    const rows = await this.db.query<{ id: string }>('DELETE FROM tj_links WHERE id = $1 RETURNING id', [id]);
+    const rows = await this.db.query<LinkRow>(`${LINK_SELECT} WHERE l.id = $1`, [id]);
     if (rows.length === 0) throw new NotFoundException('Fibre link not found');
+    const row = rows[0];
+
+    await this.db.query('DELETE FROM tj_links WHERE id = $1', [id]);
+
+    const from = await this.endpointForRow(row, 'from').catch(() => null);
+    const to = await this.endpointForRow(row, 'to').catch(() => null);
+    if (from) await this.syncDeviceCores(id, from, []);
+    if (to) await this.syncDeviceCores(id, to, []);
+    if (from) await this.syncOnuCores(id, from, []);
+    if (to) await this.syncOnuCores(id, to, []);
     return { ok: true, id };
+  }
+
+  private async resolveEndpoint(
+    tjId: string | undefined,
+    oltId: string | undefined,
+    onuId: string | undefined,
+    side: 'from' | 'to',
+  ): Promise<Endpoint> {
+    const chosen = [tjId, oltId, onuId].filter(Boolean).length;
+    if (chosen !== 1) {
+      throw new BadRequestException(
+        `Pick one ${side} device: a terminal joint, an OLT or an ONU.`,
+      );
+    }
+    const endpoint = tjId
+      ? await this.db.query<Endpoint>(
+          `SELECT 'tj'::text AS kind, id, code, name,
+                  ST_Y(location::geometry) AS lat, ST_X(location::geometry) AS lng
+             FROM tjs WHERE id = $1`,
+          [tjId],
+        )
+      : oltId
+        ? await this.db.query<Endpoint>(
+            `SELECT 'olt'::text AS kind, id, code, name,
+                    ST_Y(location::geometry) AS lat, ST_X(location::geometry) AS lng
+               FROM olts WHERE id = $1`,
+            [oltId],
+          )
+        : await this.db.query<Endpoint>(
+            `SELECT 'onu'::text AS kind, id, username AS code, fibre_id AS name,
+                    ST_Y(location::geometry) AS lat, ST_X(location::geometry) AS lng
+               FROM onus WHERE id = $1`,
+            [onuId],
+          );
+    if (endpoint.length === 0) {
+      throw new NotFoundException(`The ${side} device no longer exists.`);
+    }
+    if (endpoint[0].lat === null || endpoint[0].lng === null) {
+      throw new BadRequestException(
+        endpoint[0].kind === 'onu'
+          ? `Place ONU ${endpoint[0].code} on the map before linking it.`
+          : endpoint[0].kind === 'olt'
+            ? `Place ${endpoint[0].code} on the map before linking it.`
+            : `Set a map position for ${endpoint[0].code} before linking it.`,
+      );
+    }
+    return {
+      ...endpoint[0],
+      lat: Number(endpoint[0].lat),
+      lng: Number(endpoint[0].lng),
+    };
+  }
+
+  private async endpointForRow(row: LinkRow, side: 'from' | 'to'): Promise<Endpoint> {
+    if (side === 'from') {
+      return this.resolveEndpoint(
+        row.from_tj_id ?? undefined,
+        row.from_olt_id ?? undefined,
+        row.from_onu_id ?? undefined,
+        'from',
+      );
+    }
+    return this.resolveEndpoint(
+      row.to_tj_id ?? undefined,
+      row.to_olt_id ?? undefined,
+      row.to_onu_id ?? undefined,
+      'to',
+    );
+  }
+
+  private assertDistinct(from: Endpoint, to: Endpoint) {
+    if (from.kind === to.kind && from.id === to.id) {
+      throw new BadRequestException('A device cannot be linked to itself.');
+    }
+  }
+
+  private async assertNotLinked(from: Endpoint, to: Endpoint) {
+    const rows = await this.db.query<{ id: string }>(
+      `SELECT id FROM tj_links
+        WHERE ((from_tj_id = $1 OR from_olt_id = $2 OR from_onu_id = $3)
+               AND (to_tj_id = $4 OR to_olt_id = $5 OR to_onu_id = $6))
+           OR ((from_tj_id = $4 OR from_olt_id = $5 OR from_onu_id = $6)
+               AND (to_tj_id = $1 OR to_olt_id = $2 OR to_onu_id = $3))`,
+      [
+        from.kind === 'tj' ? from.id : null,
+        from.kind === 'olt' ? from.id : null,
+        from.kind === 'onu' ? from.id : null,
+        to.kind === 'tj' ? to.id : null,
+        to.kind === 'olt' ? to.id : null,
+        to.kind === 'onu' ? to.id : null,
+      ],
+    );
+    if (rows.length > 0) {
+      throw new BadRequestException('These devices are already linked. Edit the existing fibre instead.');
+    }
+  }
+
+  /** Marks the mapped joint cores in use on this link, and frees the ones it no longer carries. */
+  private async syncDeviceCores(linkId: string, endpoint: Endpoint | null, labels: (string | null)[]) {
+    if (!endpoint || endpoint.kind !== 'tj') return;
+    const wanted = new Set(labels.filter((label): label is string => Boolean(label)));
+    const rows = await this.db.query<{ cores: unknown; output_cores: unknown }>(
+      'SELECT cores, output_cores FROM tjs WHERE id = $1',
+      [endpoint.id],
+    );
+    if (rows.length === 0) return;
+    const row = rows[0];
+
+    const apply = (value: unknown) => {
+      const list = Array.isArray(value) ? value : [];
+      let changed = false;
+      const next = list.map((item) => {
+        const core = (item ?? {}) as Record<string, unknown> & { label?: string; status?: string; connectedLinkId?: string };
+        const isMapped = Boolean(core.label) && wanted.has(String(core.label));
+        const ownedHere = core.connectedLinkId === linkId;
+        if (isMapped && core.status !== 'in_use') {
+          changed = true;
+          return { ...core, status: 'in_use', connectedLinkId: linkId };
+        }
+        if (isMapped && ownedHere !== true) {
+          changed = true;
+          return { ...core, status: 'in_use', connectedLinkId: linkId };
+        }
+        if (!isMapped && ownedHere) {
+          changed = true;
+          const { connectedLinkId: _drop, ...rest } = core;
+          return { ...rest, status: 'free' };
+        }
+        return core;
+      });
+      return changed ? next : null;
+    };
+
+    const cores = apply(row.cores);
+    const outputCores = apply(row.output_cores);
+    if (!cores && !outputCores) return;
+
+    await this.db.query(
+      `UPDATE tjs SET cores = $2::jsonb, output_cores = $3::jsonb, updated_at = now() WHERE id = $1`,
+      [
+        endpoint.id,
+        JSON.stringify(cores ?? row.cores ?? []),
+        JSON.stringify(outputCores ?? row.output_cores ?? []),
+      ],
+    );
+  }
+
+  /** Frees or marks this ONU's cores when a link is mapped to them. */
+  private async syncOnuCores(linkId: string, endpoint: Endpoint | null, labels: (string | null)[]) {
+    if (!endpoint || endpoint.kind !== 'onu') return;
+    const wanted = new Set(labels.filter((label): label is string => Boolean(label)));
+    const rows = await this.db.query<{ cores: unknown }>('SELECT cores FROM onus WHERE id = $1', [
+      endpoint.id,
+    ]);
+    if (rows.length === 0) return;
+    const list = Array.isArray(rows[0].cores) ? rows[0].cores : [];
+    let changed = false;
+    const next = list.map((item) => {
+      const core = (item ?? {}) as Record<string, unknown> & {
+        label?: string;
+        status?: string;
+        connectedLinkId?: string;
+      };
+      const isMapped = Boolean(core.label) && wanted.has(String(core.label));
+      const ownedHere = core.connectedLinkId === linkId;
+      if (isMapped && (core.status !== 'in_use' || ownedHere !== true)) {
+        changed = true;
+        return { ...core, status: 'in_use', connectedLinkId: linkId };
+      }
+      if (!isMapped && ownedHere) {
+        changed = true;
+        const { connectedLinkId: _drop, ...rest } = core;
+        return { ...rest, status: 'free' };
+      }
+      return core;
+    });
+    if (!changed) return;
+    await this.db.query('UPDATE onus SET cores = $2::jsonb, updated_at = now() WHERE id = $1', [
+      endpoint.id,
+      JSON.stringify(next),
+    ]);
   }
 
   private mapLink(row: LinkRow) {
     return {
       id: row.id,
+      fromKind: (row.from_olt_id ? 'olt' : row.from_onu_id ? 'onu' : 'tj') as EndpointKind,
+      toKind: (row.to_olt_id ? 'olt' : row.to_onu_id ? 'onu' : 'tj') as EndpointKind,
       fromTjId: row.from_tj_id,
+      fromOltId: row.from_olt_id,
+      fromOnuId: row.from_onu_id,
       toTjId: row.to_tj_id,
+      toOltId: row.to_olt_id,
+      toOnuId: row.to_onu_id,
       fromCode: row.from_code,
       toCode: row.to_code,
       fromName: row.from_name,
@@ -153,6 +525,10 @@ export class LinkService {
       fibreId: row.fibre_id,
       cableType: row.cable_type,
       coreCount: row.core_count,
+      fromCoreLabel: row.from_core_label ?? null,
+      toCoreLabel: row.to_core_label ?? null,
+      cores: parseStoredCores(row.cores),
+      path: normalisePath(row.path),
       status: row.status,
       lengthM: row.length_m === null ? null : Number(row.length_m),
       notes: row.notes,

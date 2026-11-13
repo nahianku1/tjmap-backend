@@ -10,6 +10,15 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false },
 });
 
+async function migrate() {
+  await pool.query(
+    `ALTER TABLE tj_links ADD COLUMN IF NOT EXISTS from_core_label text`,
+  );
+  await pool.query(
+    `ALTER TABLE tj_links ADD COLUMN IF NOT EXISTS to_core_label text`,
+  );
+}
+
 type SeedCore = { label: string; color: string; count: number };
 
 type SeedTj = {
@@ -284,6 +293,8 @@ const LINK_SEED: Array<{
   fibreId: string;
   cableType: string;
   coreCount: number;
+  fromCoreLabel?: string | null;
+  toCoreLabel?: string | null;
   status?: 'active' | 'cut';
 }> = [
   { from: 'TJ-DHK-001', to: 'TJ-DHK-002', fibreId: 'F-DHK-GL-BN', cableType: '12F Armoured', coreCount: 12 },
@@ -417,7 +428,136 @@ async function seedGeography(adminId?: string) {
   console.log(`✓ ${GEO_SEED.length} districts and ${areaTotal} areas ready`);
 }
 
+type SeedOlt = {
+  code: string;
+  name: string;
+  ponPort: string;
+  uplinkPort: string;
+  ponPorts: { label: string; outputDbm: number }[];
+  ethernetPorts: { label: string; speed: '1G' | '10G' | '40G' | '100G' }[];
+  district: string;
+  area: string;
+  lat: number;
+  lng: number;
+};
+
+const OLT_SEED: SeedOlt[] = [
+  {
+    code: 'OLT-DHK-01',
+    name: 'Gulshan Core OLT',
+    ponPort: 'GPON 0/1/1',
+    uplinkPort: '10GE 0/0/1 · Uplink A',
+    ponPorts: [
+      { label: 'GPON 0/1/1', outputDbm: 3 },
+      { label: 'GPON 0/1/2', outputDbm: 5 },
+      { label: 'GPON 0/1/3', outputDbm: 7 },
+    ],
+    ethernetPorts: [
+      { label: 'GE 0/0/1', speed: '10G' },
+      { label: 'GE 0/0/2', speed: '10G' },
+      { label: 'GE 0/0/9', speed: '40G' },
+    ],
+    district: 'Dhaka',
+    area: 'Gulshan–Banani',
+    lat: 23.7807,
+    lng: 90.4172,
+  },
+  {
+    code: 'OLT-CTG-01',
+    name: 'Agrabad Aggregation OLT',
+    ponPort: 'GPON 0/2/1',
+    uplinkPort: '10GE 0/0/2 · Uplink A',
+    ponPorts: [
+      { label: 'GPON 0/2/1', outputDbm: 3 },
+      { label: 'GPON 0/2/2', outputDbm: 5 },
+    ],
+    ethernetPorts: [
+      { label: 'GE 0/0/1', speed: '10G' },
+      { label: 'GE 0/0/2', speed: '1G' },
+    ],
+    district: 'Chattogram',
+    area: 'Agrabad',
+    lat: 22.3285,
+    lng: 91.8122,
+  },
+  {
+    code: 'OLT-SYL-01',
+    name: 'Zindabazar Access OLT',
+    ponPort: 'GPON 0/3/1',
+    uplinkPort: '10GE 0/0/3 · Uplink A',
+    ponPorts: [
+      { label: 'GPON 0/3/1', outputDbm: 5 },
+      { label: 'GPON 0/3/2', outputDbm: 7 },
+    ],
+    ethernetPorts: [
+      { label: 'GE 0/0/1', speed: '10G' },
+      { label: 'GE 0/0/2', speed: '100G' },
+    ],
+    district: 'Sylhet',
+    area: 'Zindabazar',
+    lat: 24.8949,
+    lng: 91.8687,
+  },
+];
+
+/** Idempotent OLT seed; also assigns existing joints in the same district to its OLT. */
+async function seedOlts(adminId?: string) {
+  for (const olt of OLT_SEED) {
+    const areaRows = await pool.query<{ id: string; district_id: string }>(
+      `SELECT a.id, a.district_id
+         FROM areas a JOIN districts d ON d.id = a.district_id
+        WHERE lower(d.name) = lower($1) AND lower(a.name) = lower($2)`,
+      [olt.district, olt.area],
+    );
+    const area = areaRows.rows[0];
+
+    await pool.query(
+      `INSERT INTO olts (code, name, pon_port, uplink_port, pon_ports, ethernet_ports, area_id, location, created_by)
+       VALUES ($1, $2, $3, $4, $5::jsonb, $6::jsonb, $7,
+               ST_SetSRID(ST_MakePoint($8, $9), 4326)::geography, $10)
+       ON CONFLICT (lower(code)) DO NOTHING`,
+      [
+        olt.code,
+        olt.name,
+        olt.ponPort,
+        olt.uplinkPort,
+        JSON.stringify(olt.ponPorts),
+        JSON.stringify(olt.ethernetPorts),
+        area?.id ?? null,
+        olt.lng,
+        olt.lat,
+        adminId ?? null,
+      ],
+    );
+
+    // Backfill port lists on cabinets created before they existed.
+    await pool.query(
+      `UPDATE olts
+          SET pon_ports = $2::jsonb, ethernet_ports = $3::jsonb
+        WHERE lower(code) = lower($1)
+          AND (pon_ports = '[]'::jsonb OR ethernet_ports = '[]'::jsonb)`,
+      [olt.code, JSON.stringify(olt.ponPorts), JSON.stringify(olt.ethernetPorts)],
+    );
+
+    if (!area) continue;
+    const oltRows = await pool.query<{ id: string }>(
+      'SELECT id FROM olts WHERE lower(code) = lower($1)',
+      [olt.code],
+    );
+    await pool.query(
+      `UPDATE tjs SET olt_id = $1
+        WHERE olt_id IS NULL
+          AND area_id IN (SELECT id FROM areas WHERE district_id = $2)`,
+      [oltRows.rows[0].id, area.district_id],
+    );
+  }
+
+  console.log(`✓ ${OLT_SEED.length} OLTs ready`);
+}
+
 async function main() {
+  await migrate();
+
   const schema = readFileSync(join(__dirname, 'schema.sql'), 'utf8');
   await pool.query(schema);
   console.log('✓ schema ready (PostGIS enabled)');
@@ -483,10 +623,10 @@ async function main() {
       const toId = codeToId.get(link.to);
       if (!fromId || !toId) continue;
       await pool.query(
-        `INSERT INTO tj_links (from_tj_id, to_tj_id, fibre_id, cable_type, core_count, status, length_m, created_by)
-         SELECT $1, $2, $3, $4, $5, $6, ST_Distance(f.location, t.location), $7
+        `INSERT INTO tj_links (from_tj_id, to_tj_id, fibre_id, cable_type, core_count, from_core_label, to_core_label, status, length_m, created_by)
+         SELECT $1, $2, $3, $4, $5, $6, $7, $8, ST_Distance(f.location, t.location), $9
          FROM tjs f, tjs t WHERE f.id = $1 AND t.id = $2`,
-        [fromId, toId, link.fibreId, link.cableType, link.coreCount, link.status ?? 'active', adminId ?? null],
+        [fromId, toId, link.fibreId, link.cableType, link.coreCount, link.fromCoreLabel ?? null, link.toCoreLabel ?? null, link.status ?? 'active', adminId ?? null],
       );
     }
     console.log(`✓ seeded ${TJ_SEED.length} terminal joints and ${LINK_SEED.length} fibre links`);
@@ -495,6 +635,7 @@ async function main() {
   }
 
   await seedGeography(adminId);
+  await seedOlts(adminId);
 
   console.log('\nDemo accounts');
   console.log('  admin@isptj.app / Admin@12345  (full control)');

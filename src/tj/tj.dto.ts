@@ -302,6 +302,10 @@ export class CreateTjDto {
   areaId?: string | null;
 
   @IsOptional()
+  @IsUUID()
+  oltId?: string | null;
+
+  @IsOptional()
   @IsArray()
   @ArrayMaxSize(64)
   @ValidateNested({ each: true })
@@ -403,6 +407,10 @@ export class UpdateTjDto {
   areaId?: string | null;
 
   @IsOptional()
+  @IsUUID()
+  oltId?: string | null;
+
+  @IsOptional()
   @IsArray()
   @ArrayMaxSize(64)
   @ValidateNested({ each: true })
@@ -410,12 +418,69 @@ export class UpdateTjDto {
   userFibres?: UserFibreDto[];
 }
 
-export class CreateLinkDto {
-  @IsUUID()
-  fromTjId: string;
+export class LinkCoreDto {
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  @Max(288)
+  index?: number;
 
+  @IsOptional()
+  @IsString()
+  @MaxLength(40)
+  label?: string;
+
+  @IsOptional()
+  @Matches(HEX_COLOR, { message: 'Core colour must be a hex value like #22d3ee' })
+  color?: string;
+
+  @IsOptional()
+  @IsString()
+  @MaxLength(40)
+  fromCoreLabel?: string | null;
+
+  @IsOptional()
+  @IsString()
+  @MaxLength(40)
+  toCoreLabel?: string | null;
+}
+
+export class LinkPathPointDto {
+  @Type(() => Number)
+  @IsLatitude()
+  lat: number;
+
+  @Type(() => Number)
+  @IsLongitude()
+  lng: number;
+}
+
+export class CreateLinkDto {
+  /** Endpoint on the from side: exactly one of `fromTjId`, `fromOltId` or `fromOnuId`. */
+  @IsOptional()
   @IsUUID()
-  toTjId: string;
+  fromTjId?: string;
+
+  @IsOptional()
+  @IsUUID()
+  fromOltId?: string;
+
+  @IsOptional()
+  @IsUUID()
+  fromOnuId?: string;
+
+  @IsOptional()
+  @IsUUID()
+  toTjId?: string;
+
+  @IsOptional()
+  @IsUUID()
+  toOltId?: string;
+
+  @IsOptional()
+  @IsUUID()
+  toOnuId?: string;
 
   @IsString()
   @MinLength(2)
@@ -426,6 +491,16 @@ export class CreateLinkDto {
   @IsString()
   @MaxLength(40)
   cableType?: string;
+
+  @IsOptional()
+  @IsString()
+  @MaxLength(40)
+  fromCoreLabel?: string | null;
+
+  @IsOptional()
+  @IsString()
+  @MaxLength(40)
+  toCoreLabel?: string | null;
 
   @Type(() => Number)
   @IsInt()
@@ -441,6 +516,21 @@ export class CreateLinkDto {
   @IsString()
   @MaxLength(500)
   notes?: string;
+
+  @IsOptional()
+  @IsArray()
+  @ArrayMaxSize(288)
+  @ValidateNested({ each: true })
+  @Type(() => LinkCoreDto)
+  cores?: LinkCoreDto[];
+
+  /** Hand-drawn duct route between the endpoints (intermediate waypoints only). */
+  @IsOptional()
+  @IsArray()
+  @ArrayMaxSize(500)
+  @ValidateNested({ each: true })
+  @Type(() => LinkPathPointDto)
+  path?: LinkPathPointDto[];
 }
 
 export class UpdateLinkDto {
@@ -454,6 +544,16 @@ export class UpdateLinkDto {
   @IsString()
   @MaxLength(40)
   cableType?: string;
+
+  @IsOptional()
+  @IsString()
+  @MaxLength(40)
+  fromCoreLabel?: string | null;
+
+  @IsOptional()
+  @IsString()
+  @MaxLength(40)
+  toCoreLabel?: string | null;
 
   @IsOptional()
   @Type(() => Number)
@@ -470,4 +570,19 @@ export class UpdateLinkDto {
   @IsString()
   @MaxLength(500)
   notes?: string;
+
+  @IsOptional()
+  @IsArray()
+  @ArrayMaxSize(288)
+  @ValidateNested({ each: true })
+  @Type(() => LinkCoreDto)
+  cores?: LinkCoreDto[];
+
+  /** Replaces the drawn route; an empty array restores the straight span. */
+  @IsOptional()
+  @IsArray()
+  @ArrayMaxSize(500)
+  @ValidateNested({ each: true })
+  @Type(() => LinkPathPointDto)
+  path?: LinkPathPointDto[];
 }

@@ -24,6 +24,30 @@ export class DatabaseService implements OnModuleInit, OnModuleDestroy {
       ALTER TABLE tjs ADD COLUMN IF NOT EXISTS cut_data jsonb NOT NULL DEFAULT '{}'::jsonb;
       ALTER TABLE tjs ADD COLUMN IF NOT EXISTS pon_data jsonb NOT NULL DEFAULT '{}'::jsonb;
       ALTER TABLE tjs ADD COLUMN IF NOT EXISTS user_fibres jsonb NOT NULL DEFAULT '[]'::jsonb;
+
+      CREATE TABLE IF NOT EXISTS onus (
+        id          uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+        username    text NOT NULL,
+        mac_address text,
+        vlan_id     integer,
+        fibre_id    text NOT NULL,
+        cores       jsonb NOT NULL DEFAULT '[]'::jsonb,
+        notes       text,
+        area_id     uuid REFERENCES areas(id) ON DELETE SET NULL,
+        location    geography(Point, 4326),
+        created_by  uuid REFERENCES users(id) ON DELETE SET NULL,
+        created_at  timestamptz NOT NULL DEFAULT now(),
+        updated_at  timestamptz NOT NULL DEFAULT now()
+      );
+      CREATE INDEX IF NOT EXISTS onus_area_idx ON onus (area_id);
+      CREATE INDEX IF NOT EXISTS onus_location_gix ON onus USING GIST (location);
+
+      ALTER TABLE tj_links ADD COLUMN IF NOT EXISTS from_onu_id uuid REFERENCES onus(id) ON DELETE CASCADE;
+      ALTER TABLE tj_links ADD COLUMN IF NOT EXISTS to_onu_id uuid REFERENCES onus(id) ON DELETE CASCADE;
+      CREATE INDEX IF NOT EXISTS tj_links_from_onu_idx ON tj_links (from_onu_id);
+      CREATE INDEX IF NOT EXISTS tj_links_to_onu_idx ON tj_links (to_onu_id);
+
+      ALTER TABLE tj_links ADD COLUMN IF NOT EXISTS path jsonb NOT NULL DEFAULT '[]'::jsonb;
     `);
   }
 
