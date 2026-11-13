@@ -64,7 +64,7 @@ function asArray(value: unknown): unknown[] {
 
 function normaliseCores(value: unknown): OnuCore[] {
   return asArray(value)
-    .map((item, index) => {
+    .map((item, index): OnuCore | null => {
       if (!item || typeof item !== 'object') return null;
       const entry = item as { label?: unknown; color?: unknown; status?: unknown };
       const label = typeof entry.label === 'string' ? entry.label.trim() : '';
@@ -80,9 +80,9 @@ function normaliseCores(value: unknown): OnuCore[] {
           : 'free';
       const linked =
         typeof (entry as { connectedLinkId?: unknown }).connectedLinkId === 'string'
-          ? ((entry as { connectedLinkId: string }).connectedLinkId)
+          ? (entry as { connectedLinkId: string }).connectedLinkId
           : null;
-      return { label, color, status, ...(linked ? { connectedLinkId: linked } : {}) };
+      return linked ? { label, color, status, connectedLinkId: linked } : { label, color, status };
     })
     .filter((entry): entry is OnuCore => entry !== null);
 }
