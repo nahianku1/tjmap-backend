@@ -16,6 +16,7 @@ import {
   MaxLength,
   Min,
   MinLength,
+  ValidateIf,
   ValidateNested,
 } from 'class-validator';
 
@@ -517,6 +518,35 @@ export class CreateLinkDto {
   @MaxLength(500)
   notes?: string;
 
+  /** Optional map colour for this link; null/absent uses the default styling. */
+  @IsOptional()
+  @Matches(HEX_COLOR, { message: 'Link colour must be a hex value like #22d3ee' })
+  color?: string;
+
+  /** Fibre attenuation for this span at the working wavelength (typically 0.30–0.40 dB/km). */
+  @IsOptional()
+  @Type(() => Number)
+  @IsNumber()
+  @Min(0)
+  @Max(5)
+  attenuationDbPerKm?: number;
+
+  /** Fusion splices inside this span; each contributes a fixed splice loss. */
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(0)
+  @Max(288)
+  spliceCount?: number;
+
+  /** Total connector/patch-panel loss at both ends of this span. */
+  @IsOptional()
+  @Type(() => Number)
+  @IsNumber()
+  @Min(0)
+  @Max(20)
+  connectionLossDb?: number;
+
   @IsOptional()
   @IsArray()
   @ArrayMaxSize(288)
@@ -570,6 +600,33 @@ export class UpdateLinkDto {
   @IsString()
   @MaxLength(500)
   notes?: string;
+
+  /** Sending null clears the custom colour and restores the default look. */
+  @IsOptional()
+  @ValidateIf((_object, value) => value !== null)
+  @Matches(HEX_COLOR, { message: 'Link colour must be a hex value like #22d3ee' })
+  color?: string | null;
+
+  @IsOptional()
+  @Type(() => Number)
+  @IsNumber()
+  @Min(0)
+  @Max(5)
+  attenuationDbPerKm?: number;
+
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(0)
+  @Max(288)
+  spliceCount?: number;
+
+  @IsOptional()
+  @Type(() => Number)
+  @IsNumber()
+  @Min(0)
+  @Max(20)
+  connectionLossDb?: number;
 
   @IsOptional()
   @IsArray()

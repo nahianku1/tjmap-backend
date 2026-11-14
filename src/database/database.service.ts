@@ -48,6 +48,17 @@ export class DatabaseService implements OnModuleInit, OnModuleDestroy {
       CREATE INDEX IF NOT EXISTS tj_links_to_onu_idx ON tj_links (to_onu_id);
 
       ALTER TABLE tj_links ADD COLUMN IF NOT EXISTS path jsonb NOT NULL DEFAULT '[]'::jsonb;
+
+      -- Optical power budget inputs. Each span carries its own attenuation, splice and
+      -- connector counts so the OLT → TJ → ONU budget can be recomputed on read.
+      ALTER TABLE tj_links ADD COLUMN IF NOT EXISTS attenuation_db_per_km double precision NOT NULL DEFAULT 0.35;
+      ALTER TABLE tj_links ADD COLUMN IF NOT EXISTS splice_count integer NOT NULL DEFAULT 2;
+      ALTER TABLE tj_links ADD COLUMN IF NOT EXISTS connection_loss_db double precision NOT NULL DEFAULT 1.0;
+      -- Optional per-link colour drawn on the map; null keeps the default styling.
+      ALTER TABLE tj_links ADD COLUMN IF NOT EXISTS color text;
+
+      ALTER TABLE onus ADD COLUMN IF NOT EXISTS pon_type text NOT NULL DEFAULT 'gpon';
+      ALTER TABLE onus ADD COLUMN IF NOT EXISTS onu_class text NOT NULL DEFAULT 'B+';
     `);
   }
 

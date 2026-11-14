@@ -18,6 +18,11 @@ import {
 
 export const ONU_CORE_STATUSES = ['in_use', 'free', 'spliced', 'damaged'] as const;
 
+export const PON_TYPES = ['epon', 'gpon'] as const;
+
+/** ODN loss windows the ONU optic is specified for. */
+export const ONU_CLASSES = ['A', 'B', 'B+', 'C', 'C+', 'C++', 'PX10', 'PX20', 'PX30'] as const;
+
 export class OnuCoreDto {
   @IsString()
   @MinLength(1)
@@ -54,6 +59,14 @@ export class CreateOnuDto {
   @MinLength(1)
   @MaxLength(60)
   fibreId: string;
+
+  @IsOptional()
+  @IsIn(PON_TYPES)
+  ponType?: (typeof PON_TYPES)[number];
+
+  @IsOptional()
+  @IsIn(ONU_CLASSES)
+  onuClass?: (typeof ONU_CLASSES)[number];
 
   @IsOptional()
   @IsArray()
@@ -105,6 +118,14 @@ export class UpdateOnuDto {
   @MinLength(1)
   @MaxLength(60)
   fibreId?: string;
+
+  @IsOptional()
+  @IsIn(PON_TYPES)
+  ponType?: (typeof PON_TYPES)[number];
+
+  @IsOptional()
+  @IsIn(ONU_CLASSES)
+  onuClass?: (typeof ONU_CLASSES)[number];
 
   @IsOptional()
   @IsArray()

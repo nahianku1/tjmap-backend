@@ -1,6 +1,12 @@
 import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
 import { DatabaseService } from '../database/database.service';
-import { CreateOnuDto, ONU_CORE_STATUSES, UpdateOnuDto } from './onu.dto';
+import {
+  CreateOnuDto,
+  ONU_CLASSES,
+  ONU_CORE_STATUSES,
+  PON_TYPES,
+  UpdateOnuDto,
+} from './onu.dto';
 
 export interface OnuCore {
   label: string;
@@ -16,6 +22,8 @@ interface OnuRow {
   mac_address: string | null;
   vlan_id: number | null;
   fibre_id: string;
+  pon_type: string;
+  onu_class: string;
   cores: unknown;
   notes: string | null;
   area_id: string | null;
@@ -29,7 +37,8 @@ interface OnuRow {
 }
 
 const ONU_SELECT = `
-  SELECT o.id, o.username, o.mac_address, o.vlan_id, o.fibre_id, o.cores, o.notes,
+  SELECT o.id, o.username, o.mac_address, o.vlan_id, o.fibre_id, o.pon_type, o.onu_class,
+         o.cores, o.notes,
          o.area_id, a.name AS area_name, a.district_id, d.name AS district_name,
          ST_Y(o.location::geometry) AS lat,
          ST_X(o.location::geometry) AS lng,
@@ -111,17 +120,20 @@ export class OnuService {
     this.assertVlan(dto.vlanId);
 
     const rows = await this.db.query<{ id: string }>(
-      `INSERT INTO onus (username, mac_address, vlan_id, fibre_id, cores, notes, area_id, location, created_by)
-       VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7,
-               CASE WHEN $8::double precision IS NULL THEN NULL
-                    ELSE ST_SetSRID(ST_MakePoint($9, $8), 4326)::geography END,
-               $10)
+      `       INSERT INTO onus (username, mac_address, vlan_id, fibre_id, pon_type, onu_class,
+                         cores, notes, area_id, location, created_by)
+       VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9,
+               CASE WHEN $10::double precision IS NULL THEN NULL
+                    ELSE ST_SetSRID(ST_MakePoint($11, $10), 4326)::geography END,
+               $12)
        RETURNING id`,
       [
         dto.username.trim(),
         dto.macAddress?.trim() || null,
         dto.vlanId ?? null,
         dto.fibreId.trim(),
+        dto.ponType ?? 'gpon',
+        dto.onuClass ?? 'B+',
         JSON.stringify(normaliseCores(dto.cores)),
         dto.notes?.trim() || null,
         dto.areaId ?? null,
@@ -159,11 +171,13 @@ export class OnuService {
          mac_address = $3,
          vlan_id = $4,
          fibre_id = $5,
-         cores = $6::jsonb,
-         notes = $7,
-         area_id = $8,
-         location = CASE WHEN $9::double precision IS NULL THEN NULL
-                         ELSE ST_SetSRID(ST_MakePoint($10, $9), 4326)::geography END,
+         pon_type = $6,
+         onu_class = $7,
+         cores = $8::jsonb,
+         notes = $9,
+         area_id = $10,
+         location = CASE WHEN $11::double precision IS NULL THEN NULL
+                         ELSE ST_SetSRID(ST_MakePoint($12, $11), 4326)::geography END,
          updated_at = now()
        WHERE id = $1
        RETURNING id`,
@@ -173,6 +187,8 @@ export class OnuService {
         dto.macAddress !== undefined ? dto.macAddress?.trim() || null : existing.macAddress ?? null,
         dto.vlanId !== undefined ? dto.vlanId ?? null : existing.vlanId ?? null,
         dto.fibreId?.trim() || existing.fibreId,
+        dto.ponType ?? existing.ponType ?? 'gpon',
+        dto.onuClass ?? existing.onuClass ?? 'B+',
         JSON.stringify(cores),
         dto.notes !== undefined ? dto.notes?.trim() || null : existing.notes,
         dto.areaId !== undefined ? dto.areaId ?? null : existing.areaId,
@@ -215,6 +231,12 @@ export class OnuService {
       macAddress: row.mac_address,
       vlanId: row.vlan_id === null ? null : Number(row.vlan_id),
       fibreId: row.fibre_id,
+      ponType: PON_TYPES.includes(row.pon_type as (typeof PON_TYPES)[number])
+        ? row.pon_type
+        : 'gpon',
+      onuClass: ONU_CLASSES.includes(row.onu_class as (typeof ONU_CLASSES)[number])
+        ? row.onu_class
+        : 'B+',
       cores: normaliseCores(row.cores),
       notes: row.notes,
       areaId: row.area_id,

@@ -63,6 +63,10 @@ interface LinkRow {
   path: unknown;
   status: string;
   length_m: number | null;
+  attenuation_db_per_km: number;
+  splice_count: number;
+  connection_loss_db: number;
+  color: string | null;
   notes: string | null;
   created_at: Date;
   updated_at: Date;
@@ -97,8 +101,9 @@ const LINK_SELECT = `
          ST_Y(COALESCE(t.location, o.location, ou.location)::geometry) AS to_lat,
          ST_X(COALESCE(t.location, o.location, ou.location)::geometry) AS to_lng,
          l.fibre_id, l.cable_type, l.core_count, l.from_core_label, l.to_core_label,
-         l.cores, l.path, l.status, l.length_m, l.notes,
-         l.created_at, l.updated_at
+         l.cores, l.path, l.status, l.length_m,
+         l.attenuation_db_per_km, l.splice_count, l.connection_loss_db, l.color,
+         l.notes, l.created_at, l.updated_at
   FROM tj_links l
   LEFT JOIN tjs f ON f.id = l.from_tj_id
   LEFT JOIN olts fo ON fo.id = l.from_olt_id
@@ -372,6 +377,19 @@ export class TjService {
       path: Array.isArray(row.path) ? row.path : [],
       status: row.status,
       lengthM: row.length_m === null ? null : Number(row.length_m),
+      attenuationDbPerKm:
+        row.attenuation_db_per_km === null || row.attenuation_db_per_km === undefined
+          ? 0.35
+          : Number(row.attenuation_db_per_km),
+      spliceCount:
+        row.splice_count === null || row.splice_count === undefined
+          ? 2
+          : Number(row.splice_count),
+      connectionLossDb:
+        row.connection_loss_db === null || row.connection_loss_db === undefined
+          ? 1.0
+          : Number(row.connection_loss_db),
+      color: row.color ?? null,
       notes: row.notes,
       createdAt: new Date(row.created_at).toISOString(),
       updatedAt: new Date(row.updated_at).toISOString(),

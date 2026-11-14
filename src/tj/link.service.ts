@@ -52,6 +52,10 @@ interface LinkRow {
   path: unknown;
   status: string;
   length_m: number | null;
+  attenuation_db_per_km: number;
+  splice_count: number;
+  connection_loss_db: number;
+  color: string | null;
   notes: string | null;
   created_at: Date;
   updated_at: Date;
@@ -132,7 +136,9 @@ const LINK_SELECT = `
          ST_Y(COALESCE(t.location, o.location, ou.location)::geometry) AS to_lat,
          ST_X(COALESCE(t.location, o.location, ou.location)::geometry) AS to_lng,
          l.fibre_id, l.cable_type, l.core_count, l.from_core_label, l.to_core_label,
-         l.cores, l.path, l.status, l.length_m, l.notes, l.created_at, l.updated_at
+         l.cores, l.path, l.status, l.length_m,
+         l.attenuation_db_per_km, l.splice_count, l.connection_loss_db, l.color,
+         l.notes, l.created_at, l.updated_at
   FROM tj_links l
   LEFT JOIN tjs f ON f.id = l.from_tj_id
   LEFT JOIN olts fo ON fo.id = l.from_olt_id
@@ -218,9 +224,10 @@ export class LinkService {
       `INSERT INTO tj_links (from_tj_id, from_olt_id, from_onu_id,
                              to_tj_id, to_olt_id, to_onu_id,
                              fibre_id, cable_type, core_count, from_core_label, to_core_label,
-                             cores, status, notes, created_by, path, length_m)
+                             cores, status, notes, created_by, path, length_m,
+                             attenuation_db_per_km, splice_count, connection_loss_db, color)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::jsonb, $13, $14, $15,
-               $16::jsonb, $17)
+               $16::jsonb, $17, $18, $19, $20, $21)
        RETURNING id`,
       [
         from.kind === 'tj' ? from.id : null,
@@ -240,6 +247,10 @@ export class LinkService {
         userId,
         JSON.stringify(path),
         lengthM,
+        dto.attenuationDbPerKm ?? 0.35,
+        dto.spliceCount ?? 2,
+        dto.connectionLossDb ?? 1.0,
+        dto.color ?? null,
       ],
     );
 
@@ -282,6 +293,10 @@ export class LinkService {
          notes = $9,
          path = $10::jsonb,
          length_m = $11,
+         attenuation_db_per_km = $12,
+         splice_count = $13,
+         connection_loss_db = $14,
+         color = $15,
          updated_at = now()
        WHERE id = $1`,
       [
@@ -296,6 +311,10 @@ export class LinkService {
         dto.notes !== undefined ? dto.notes?.trim() || null : row.notes,
         JSON.stringify(path),
         lengthM,
+        dto.attenuationDbPerKm ?? row.attenuation_db_per_km ?? 0.35,
+        dto.spliceCount ?? row.splice_count ?? 2,
+        dto.connectionLossDb ?? row.connection_loss_db ?? 1.0,
+        dto.color !== undefined ? dto.color : row.color,
       ],
     );
 
@@ -531,6 +550,19 @@ export class LinkService {
       path: normalisePath(row.path),
       status: row.status,
       lengthM: row.length_m === null ? null : Number(row.length_m),
+      attenuationDbPerKm:
+        row.attenuation_db_per_km === null || row.attenuation_db_per_km === undefined
+          ? 0.35
+          : Number(row.attenuation_db_per_km),
+      spliceCount:
+        row.splice_count === null || row.splice_count === undefined
+          ? 2
+          : Number(row.splice_count),
+      connectionLossDb:
+        row.connection_loss_db === null || row.connection_loss_db === undefined
+          ? 1.0
+          : Number(row.connection_loss_db),
+      color: row.color ?? null,
       notes: row.notes,
       createdAt: new Date(row.created_at).toISOString(),
       updatedAt: new Date(row.updated_at).toISOString(),
