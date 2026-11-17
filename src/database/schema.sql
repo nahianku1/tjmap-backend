@@ -141,8 +141,8 @@ CREATE TABLE IF NOT EXISTS tj_links (
   CONSTRAINT tj_links_status_valid CHECK (status IN ('active', 'cut'))
 );
 
-CREATE UNIQUE INDEX IF NOT EXISTS tj_links_pair_unique
-  ON tj_links (LEAST(from_tj_id, to_tj_id), GREATEST(from_tj_id, to_tj_id));
+-- The same two devices may be joined by several fibres (one span per fibre ID).
+DROP INDEX IF EXISTS tj_links_pair_unique;
 CREATE INDEX IF NOT EXISTS tj_links_from_idx ON tj_links (from_tj_id);
 CREATE INDEX IF NOT EXISTS tj_links_to_idx ON tj_links (to_tj_id);
 

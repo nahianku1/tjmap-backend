@@ -1,5 +1,6 @@
 import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
 import { DatabaseService } from '../database/database.service';
+import { linksTouching, releaseDeletedLinkCores } from '../database/link-core-release';
 import { guardDuplicate } from '../database/pg-errors';
 import { OltService } from '../olt/olt.service';
 import { OnuService } from '../onu/onu.service';
@@ -19,6 +20,7 @@ interface TjRow {
   cores: unknown;
   output_cores: unknown;
   splitter: unknown;
+  splitters: unknown;
   is_cut: boolean;
   cut_reason: string | null;
   cut_severity: string | null;
@@ -77,7 +79,7 @@ const TJ_SELECT = `
          ST_Y(t.location::geometry) AS lat,
          ST_X(t.location::geometry) AS lng,
          t.address, t.notes, t.fibre_id, t.input_power_dbm,
-         t.cores, t.output_cores, t.splitter,
+         t.cores, t.output_cores, t.splitter, t.splitters,
          t.is_cut, t.cut_reason, t.cut_severity,
          t.cut_data, t.pon_data, t.user_fibres,
          t.area_id, a.name AS area_name, a.district_id, d.name AS district_name,
@@ -182,9 +184,11 @@ export class TjService {
       this.db.query<{ id: string }>(
       `INSERT INTO tjs (code, name, tj_type, location, address, notes, fibre_id,
                         input_power_dbm, cores, output_cores, splitter,
-                        is_cut, cut_reason, cut_severity, cut_data, pon_data, area_id, user_fibres, created_by, olt_id)
+                        is_cut, cut_reason, cut_severity, cut_data, pon_data, area_id, user_fibres, created_by, olt_id,
+                        splitters)
        VALUES ($1, $2, $3, ST_SetSRID(ST_MakePoint($4, $5), 4326)::geography, $6, $7, $8,
-               $9, $10::jsonb, $11::jsonb, $12::jsonb, $13, $14, $15, $16::jsonb, $17::jsonb, $18, $19::jsonb, $20, $21)
+               $9, $10::jsonb, $11::jsonb, $12::jsonb, $13, $14, $15, $16::jsonb, $17::jsonb, $18, $19::jsonb, $20, $21,
+               $22::jsonb)
        RETURNING id`,
       [
         dto.code.trim().toUpperCase(),
@@ -208,6 +212,7 @@ export class TjService {
         JSON.stringify(dto.userFibres ?? []),
         userId,
         dto.oltId ?? null,
+        JSON.stringify(dto.splitters ?? (dto.splitter ? [dto.splitter] : [])),
       ],
     ),
       'A terminal joint with this code already exists.',
@@ -245,6 +250,7 @@ export class TjService {
          area_id = $19,
          user_fibres = $20::jsonb,
          olt_id = $21,
+         splitters = $22::jsonb,
          updated_at = now()
        WHERE id = $1
        RETURNING id`,
@@ -274,6 +280,11 @@ export class TjService {
         dto.areaId !== undefined ? dto.areaId ?? null : existing.areaId,
         JSON.stringify(dto.userFibres ?? (existing as any).userFibres ?? []),
         dto.oltId !== undefined ? dto.oltId ?? null : existing.oltId,
+        JSON.stringify(
+          dto.splitters ??
+            (existing as any).splitters ??
+            (existing.splitter ? [existing.splitter] : []),
+        ),
       ],
     ),
       'A terminal joint with this code already exists.',
@@ -295,13 +306,21 @@ export class TjService {
   }
 
   async remove(id: string) {
+    const links = await linksTouching(this.db, 'tj', id);
     const rows = await this.db.query<{ id: string }>('DELETE FROM tjs WHERE id = $1 RETURNING id', [id]);
     if (rows.length === 0) throw new NotFoundException('Terminal joint not found');
+    await releaseDeletedLinkCores(this.db, links, id);
     return { ok: true, id };
   }
 
   private mapTj(row: TjRow) {
     const rawSplitter = (row.splitter as any) ?? { enabled: false, ratio: null, outputs: [] };
+    // A joint can carry several splitters; the legacy single `splitter` column is
+    // folded in so older rows still report one.
+    const rawSplitters =
+      Array.isArray(row.splitters) && row.splitters.length > 0
+        ? (row.splitters as any[])
+        : [rawSplitter];
     const rawOutputCores = (row.output_cores as any) ?? rawSplitter.outputs ?? [];
 
     return {
@@ -317,7 +336,8 @@ export class TjService {
       inputPowerDbm: row.input_power_dbm !== null && row.input_power_dbm !== undefined ? Number(row.input_power_dbm) : null,
       cores: (row.cores as any) ?? [],
       outputCores: rawOutputCores,
-      splitter: rawSplitter,
+      splitter: rawSplitters[0] ?? rawSplitter,
+      splitters: rawSplitters,
       isCut: row.is_cut,
       cutReason: row.cut_reason,
       cutSeverity: row.cut_severity,

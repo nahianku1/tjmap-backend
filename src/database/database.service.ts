@@ -24,6 +24,8 @@ export class DatabaseService implements OnModuleInit, OnModuleDestroy {
       ALTER TABLE tjs ADD COLUMN IF NOT EXISTS cut_data jsonb NOT NULL DEFAULT '{}'::jsonb;
       ALTER TABLE tjs ADD COLUMN IF NOT EXISTS pon_data jsonb NOT NULL DEFAULT '{}'::jsonb;
       ALTER TABLE tjs ADD COLUMN IF NOT EXISTS user_fibres jsonb NOT NULL DEFAULT '[]'::jsonb;
+      -- A joint can carry more than one optical splitter.
+      ALTER TABLE tjs ADD COLUMN IF NOT EXISTS splitters jsonb NOT NULL DEFAULT '[]'::jsonb;
 
       CREATE TABLE IF NOT EXISTS onus (
         id          uuid PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -59,6 +61,10 @@ export class DatabaseService implements OnModuleInit, OnModuleDestroy {
 
       ALTER TABLE onus ADD COLUMN IF NOT EXISTS pon_type text NOT NULL DEFAULT 'gpon';
       ALTER TABLE onus ADD COLUMN IF NOT EXISTS onu_class text NOT NULL DEFAULT 'B+';
+
+      -- Two devices can be joined by several fibres, so a device pair is no
+      -- longer unique; each span is identified by its own fibre ID.
+      DROP INDEX IF EXISTS tj_links_pair_unique;
     `);
   }
 

@@ -1,5 +1,6 @@
 import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
 import { DatabaseService } from '../database/database.service';
+import { linksTouching, releaseDeletedLinkCores } from '../database/link-core-release';
 import { guardDuplicate } from '../database/pg-errors';
 import { CreateOltDto, ETHERNET_SPEEDS, UpdateOltDto } from './olt.dto';
 
@@ -285,8 +286,10 @@ export class OltService {
   }
 
   async remove(id: string) {
+    const links = await linksTouching(this.db, 'olt', id);
     const rows = await this.db.query<{ id: string }>('DELETE FROM olts WHERE id = $1 RETURNING id', [id]);
     if (rows.length === 0) throw new NotFoundException('OLT not found');
+    await releaseDeletedLinkCores(this.db, links, id);
     return { ok: true, id };
   }
 

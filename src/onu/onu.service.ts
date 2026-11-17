@@ -1,5 +1,6 @@
 import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
 import { DatabaseService } from '../database/database.service';
+import { linksTouching, releaseDeletedLinkCores } from '../database/link-core-release';
 import {
   CreateOnuDto,
   ONU_CLASSES,
@@ -200,8 +201,10 @@ export class OnuService {
   }
 
   async remove(id: string) {
+    const links = await linksTouching(this.db, 'onu', id);
     const rows = await this.db.query<{ id: string }>('DELETE FROM onus WHERE id = $1 RETURNING id', [id]);
     if (rows.length === 0) throw new NotFoundException('ONU not found');
+    await releaseDeletedLinkCores(this.db, links, id);
     return { ok: true, id };
   }
 

@@ -275,6 +275,14 @@ export class CreateTjDto {
   @Type(() => SplitterDto)
   splitter?: SplitterDto;
 
+  /** Several splitters can sit in the same joint (cascaded or parallel legs). */
+  @IsOptional()
+  @IsArray()
+  @ArrayMaxSize(8)
+  @ValidateNested({ each: true })
+  @Type(() => SplitterDto)
+  splitters?: SplitterDto[];
+
   @IsOptional()
   @ValidateNested()
   @Type(() => CutDataDto)
@@ -380,6 +388,14 @@ export class UpdateTjDto {
   @Type(() => SplitterDto)
   splitter?: SplitterDto;
 
+  /** Several splitters can sit in the same joint (cascaded or parallel legs). */
+  @IsOptional()
+  @IsArray()
+  @ArrayMaxSize(8)
+  @ValidateNested({ each: true })
+  @Type(() => SplitterDto)
+  splitters?: SplitterDto[];
+
   @IsOptional()
   @ValidateNested()
   @Type(() => CutDataDto)
@@ -445,6 +461,14 @@ export class LinkCoreDto {
   @IsString()
   @MaxLength(40)
   toCoreLabel?: string | null;
+
+  /** Extra loss on this strand (dB) — a repaired, bent or degraded core carries more. */
+  @IsOptional()
+  @Type(() => Number)
+  @IsNumber()
+  @Min(0)
+  @Max(99)
+  lossDb?: number;
 }
 
 export class LinkPathPointDto {

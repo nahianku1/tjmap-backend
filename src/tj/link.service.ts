@@ -25,6 +25,15 @@ export interface LinkCore {
   status: 'connected' | 'free';
   fromCoreLabel: string | null;
   toCoreLabel: string | null;
+  /** Extra loss carried by this strand, in dB (0 for a healthy core). */
+  lossDb: number;
+}
+
+/** Clamps the per-core extra loss to a sane 0–99 dB range. */
+function normaliseLoss(value: unknown): number {
+  const loss = Number(value);
+  if (!Number.isFinite(loss)) return 0;
+  return Math.round(Math.min(Math.max(loss, 0), 99) * 100) / 100;
 }
 
 interface LinkRow {
@@ -162,6 +171,7 @@ function normaliseCores(
           color: CORE_COLORS[index % CORE_COLORS.length],
           fromCoreLabel: index === 0 ? legacyFrom ?? null : null,
           toCoreLabel: index === 0 ? legacyTo ?? null : null,
+          lossDb: 0,
         }));
 
   return source.slice(0, 288).map((row, index) => {
@@ -174,6 +184,7 @@ function normaliseCores(
       fromCoreLabel,
       toCoreLabel,
       status: fromCoreLabel && toCoreLabel ? 'connected' : 'free',
+      lossDb: normaliseLoss(row.lossDb),
     };
   });
 }
@@ -189,6 +200,7 @@ function parseStoredCores(value: unknown): LinkCore[] {
       status: entry.status === 'connected' ? 'connected' : 'free',
       fromCoreLabel: entry.fromCoreLabel ?? null,
       toCoreLabel: entry.toCoreLabel ?? null,
+      lossDb: normaliseLoss(entry.lossDb),
     };
   });
 }
@@ -212,7 +224,6 @@ export class LinkService {
     const from = await this.resolveEndpoint(dto.fromTjId, dto.fromOltId, dto.fromOnuId, 'from');
     const to = await this.resolveEndpoint(dto.toTjId, dto.toOltId, dto.toOnuId, 'to');
     this.assertDistinct(from, to);
-    await this.assertNotLinked(from, to);
 
     const cores = normaliseCores(dto.cores, dto.coreCount ?? dto.cores?.length ?? 0, dto.fromCoreLabel, dto.toCoreLabel);
     const primaryFrom = cores.find((core) => core.fromCoreLabel)?.fromCoreLabel ?? null;
@@ -412,27 +423,6 @@ export class LinkService {
   private assertDistinct(from: Endpoint, to: Endpoint) {
     if (from.kind === to.kind && from.id === to.id) {
       throw new BadRequestException('A device cannot be linked to itself.');
-    }
-  }
-
-  private async assertNotLinked(from: Endpoint, to: Endpoint) {
-    const rows = await this.db.query<{ id: string }>(
-      `SELECT id FROM tj_links
-        WHERE ((from_tj_id = $1 OR from_olt_id = $2 OR from_onu_id = $3)
-               AND (to_tj_id = $4 OR to_olt_id = $5 OR to_onu_id = $6))
-           OR ((from_tj_id = $4 OR from_olt_id = $5 OR from_onu_id = $6)
-               AND (to_tj_id = $1 OR to_olt_id = $2 OR to_onu_id = $3))`,
-      [
-        from.kind === 'tj' ? from.id : null,
-        from.kind === 'olt' ? from.id : null,
-        from.kind === 'onu' ? from.id : null,
-        to.kind === 'tj' ? to.id : null,
-        to.kind === 'olt' ? to.id : null,
-        to.kind === 'onu' ? to.id : null,
-      ],
-    );
-    if (rows.length > 0) {
-      throw new BadRequestException('These devices are already linked. Edit the existing fibre instead.');
     }
   }
 
