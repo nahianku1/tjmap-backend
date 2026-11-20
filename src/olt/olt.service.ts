@@ -2,10 +2,13 @@ import { BadRequestException, Injectable, NotFoundException } from '@nestjs/comm
 import { DatabaseService } from '../database/database.service';
 import { linksTouching, releaseDeletedLinkCores } from '../database/link-core-release';
 import { guardDuplicate } from '../database/pg-errors';
+import { resolvePlacement } from '../database/placement';
 import { CreateOltDto, ETHERNET_SPEEDS, UpdateOltDto } from './olt.dto';
 
 export interface PonPort {
   label: string;
+  /** Optional friendly name; the label stays the hardware port id. */
+  name: string | null;
   outputDbm: number | null;
   vlanId: number | null;
 }
@@ -30,9 +33,12 @@ interface OltRow {
   uplink_port: string | null;
   pon_ports: unknown;
   ethernet_ports: unknown;
+  fibre_id: string | null;
   notes: string | null;
   area_id: string | null;
   area_name: string | null;
+  sub_area_id: string | null;
+  sub_area_name: string | null;
   district_id: string | null;
   district_name: string | null;
   lat: number | null;
@@ -44,15 +50,17 @@ interface OltRow {
 
 const OLT_SELECT = `
   SELECT o.id, o.code, o.name, o.pon_port, o.uplink_port,
-         o.pon_ports, o.ethernet_ports, o.notes,
+         o.pon_ports, o.ethernet_ports, o.fibre_id, o.notes,
          o.area_id, a.name AS area_name, a.district_id, d.name AS district_name,
+         o.sub_area_id, sa.name AS sub_area_name,
          ST_Y(o.location::geometry) AS lat,
          ST_X(o.location::geometry) AS lng,
          (SELECT count(*) FROM tjs t WHERE t.olt_id = o.id)::int AS tj_count,
          o.created_at, o.updated_at
   FROM olts o
   LEFT JOIN areas a ON a.id = o.area_id
-  LEFT JOIN districts d ON d.id = a.district_id`;
+  LEFT JOIN districts d ON d.id = a.district_id
+  LEFT JOIN sub_areas sa ON sa.id = o.sub_area_id`;
 
 function slugCode(value: string, fallback: string): string {
   const slug = value
@@ -95,12 +103,14 @@ function normalisePonPorts(value: unknown): PonPort[] {
   return asArray(value)
     .map((item) => {
       if (!item || typeof item !== 'object') return null;
-      const entry = item as { label?: unknown; outputDbm?: unknown; vlanId?: unknown };
+      const entry = item as { label?: unknown; name?: unknown; outputDbm?: unknown; vlanId?: unknown };
       const label = typeof entry.label === 'string' ? entry.label.trim() : '';
       if (!label) return null;
+      const name = typeof entry.name === 'string' ? entry.name.trim() : '';
       const dbm = entry.outputDbm;
       return {
         label,
+        name: name || null,
         outputDbm: typeof dbm === 'number' && Number.isFinite(dbm) ? dbm : null,
         vlanId: normaliseVlan(entry.vlanId),
       };
@@ -190,7 +200,7 @@ export class OltService {
   }
 
   async create(dto: CreateOltDto, userId: string) {
-    await this.assertArea(dto.areaId);
+    const placement = await resolvePlacement(this.db, dto.areaId, dto.subAreaId);
     this.assertLocation(dto.lat, dto.lng);
 
     const ponPorts = normalisePonPorts(dto.ponPorts);
@@ -202,11 +212,11 @@ export class OltService {
 
     const rows = await guardDuplicate(
       this.db.query<{ id: string }>(
-        `INSERT INTO olts (code, name, pon_port, uplink_port, pon_ports, ethernet_ports, notes, area_id, location, created_by)
-         VALUES ($1, $2, $3, $4, $5::jsonb, $6::jsonb, $7, $8,
-                 CASE WHEN $9::double precision IS NULL THEN NULL
-                      ELSE ST_SetSRID(ST_MakePoint($10, $9), 4326)::geography END,
-                 $11)
+        `INSERT INTO olts (code, name, pon_port, uplink_port, pon_ports, ethernet_ports, fibre_id, notes, area_id, location, created_by, sub_area_id)
+         VALUES ($1, $2, $3, $4, $5::jsonb, $6::jsonb, $7, $8, $9,
+                 CASE WHEN $10::double precision IS NULL THEN NULL
+                      ELSE ST_SetSRID(ST_MakePoint($11, $10), 4326)::geography END,
+                 $12, $13)
          RETURNING id`,
         [
           slugCode(dto.code ?? dto.name, 'OLT'),
@@ -215,11 +225,13 @@ export class OltService {
           uplinkPort,
           JSON.stringify(ponPorts),
           JSON.stringify(ethernetPorts),
+          dto.fibreId?.trim() || null,
           dto.notes?.trim() || null,
-          dto.areaId ?? null,
+          placement.areaId,
           dto.lat ?? null,
           dto.lng ?? null,
           userId,
+          placement.subAreaId,
         ],
       ),
       'An OLT with this name or code already exists.',
@@ -229,7 +241,11 @@ export class OltService {
 
   async update(id: string, dto: UpdateOltDto) {
     const existing = await this.get(id);
-    if (dto.areaId !== undefined) await this.assertArea(dto.areaId);
+    const placement = await resolvePlacement(
+      this.db,
+      dto.areaId !== undefined ? dto.areaId : existing.areaId,
+      dto.subAreaId !== undefined ? dto.subAreaId : existing.subAreaId,
+    );
     this.assertLocation(dto.lat ?? existing.lat ?? undefined, dto.lng ?? existing.lng ?? undefined);
 
     const lat = dto.lat ?? existing.lat;
@@ -259,10 +275,12 @@ export class OltService {
            uplink_port = $5,
            pon_ports = $6::jsonb,
            ethernet_ports = $7::jsonb,
-           notes = $8,
-           area_id = $9,
-           location = CASE WHEN $10::double precision IS NULL THEN NULL
-                           ELSE ST_SetSRID(ST_MakePoint($11, $10), 4326)::geography END,
+           fibre_id = $8,
+           notes = $9,
+           area_id = $10,
+           location = CASE WHEN $11::double precision IS NULL THEN NULL
+                           ELSE ST_SetSRID(ST_MakePoint($12, $11), 4326)::geography END,
+           sub_area_id = $13,
            updated_at = now()
          WHERE id = $1
          RETURNING id`,
@@ -274,10 +292,12 @@ export class OltService {
           uplinkPort,
           JSON.stringify(ponPorts),
           JSON.stringify(ethernetPorts),
+          dto.fibreId !== undefined ? dto.fibreId?.trim() || null : existing.fibreId,
           dto.notes !== undefined ? dto.notes?.trim() || null : existing.notes,
-          dto.areaId !== undefined ? dto.areaId ?? null : existing.areaId,
+          placement.areaId,
           lat,
           lng,
+          placement.subAreaId,
         ],
       ),
       'An OLT with this name or code already exists.',
@@ -291,12 +311,6 @@ export class OltService {
     if (rows.length === 0) throw new NotFoundException('OLT not found');
     await releaseDeletedLinkCores(this.db, links, id);
     return { ok: true, id };
-  }
-
-  private async assertArea(areaId?: string | null) {
-    if (!areaId) return;
-    const rows = await this.db.query<{ id: string }>('SELECT id FROM areas WHERE id = $1', [areaId]);
-    if (rows.length === 0) throw new BadRequestException('That area no longer exists.');
   }
 
   private assertLocation(lat?: number, lng?: number) {
@@ -326,9 +340,12 @@ export class OltService {
       uplinkPort: row.uplink_port,
       ponPorts,
       ethernetPorts,
+      fibreId: row.fibre_id,
       notes: row.notes,
       areaId: row.area_id,
       areaName: row.area_name,
+      subAreaId: row.sub_area_id,
+      subAreaName: row.sub_area_name,
       districtId: row.district_id,
       districtName: row.district_name,
       lat: row.lat === null ? null : Number(row.lat),

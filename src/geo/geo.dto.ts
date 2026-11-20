@@ -75,3 +75,40 @@ export class UpdateAreaDto {
   @MaxLength(240)
   description?: string;
 }
+
+export class CreateSubAreaDto {
+  @IsString()
+  @MinLength(2)
+  @MaxLength(60)
+  name: string;
+
+  @IsOptional()
+  @IsString()
+  @Matches(CODE, { message: 'Sub-area code may only contain letters, numbers, dashes and underscores' })
+  @MaxLength(12)
+  code?: string;
+
+  @IsOptional()
+  @IsString()
+  @MaxLength(240)
+  description?: string;
+}
+
+export class UpdateSubAreaDto {
+  @IsOptional()
+  @IsString()
+  @MinLength(2)
+  @MaxLength(60)
+  name?: string;
+
+  @IsOptional()
+  @IsString()
+  @Matches(CODE, { message: 'Sub-area code may only contain letters, numbers, dashes and underscores' })
+  @MaxLength(12)
+  code?: string;
+
+  @IsOptional()
+  @IsString()
+  @MaxLength(240)
+  description?: string;
+}

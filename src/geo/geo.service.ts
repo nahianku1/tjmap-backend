@@ -1,8 +1,16 @@
 import { Injectable, NotFoundException } from '@nestjs/common';
 import { DatabaseService } from '../database/database.service';
 import { guardDuplicate } from '../database/pg-errors';
+import { releaseLinkCores, type DeviceLinkRow } from '../database/link-core-release';
 import { TjService } from '../tj/tj.service';
-import { CreateAreaDto, CreateDistrictDto, UpdateAreaDto, UpdateDistrictDto } from './geo.dto';
+import {
+  CreateAreaDto,
+  CreateDistrictDto,
+  CreateSubAreaDto,
+  UpdateAreaDto,
+  UpdateDistrictDto,
+  UpdateSubAreaDto,
+} from './geo.dto';
 
 interface DistrictRow {
   id: string;
@@ -36,6 +44,23 @@ interface AreaRow {
   max_lat: number | null;
   min_lng: number | null;
   max_lng: number | null;
+  created_at: Date;
+  updated_at: Date;
+}
+
+interface SubAreaRow {
+  id: string;
+  area_id: string;
+  area_name: string;
+  district_id: string;
+  district_name: string;
+  code: string | null;
+  name: string;
+  description: string | null;
+  tj_count: number;
+  olt_count: number;
+  onu_count: number;
+  link_count: number;
   created_at: Date;
   updated_at: Date;
 }
@@ -95,8 +120,26 @@ const AREA_SELECT = `
   ) s ON true
 `;
 
-/** Camera fit for a bounding box: keeps the whole set inside ~60% of the viewport. */
-export function boundsZoom(
+const SUB_AREA_SELECT = `
+  SELECT s.id, s.area_id, a.name AS area_name, a.district_id, d.name AS district_name,
+         s.code, s.name, s.description, s.created_at, s.updated_at,
+         COALESCE(c.tj_count, 0) AS tj_count,
+         COALESCE(c.olt_count, 0) AS olt_count,
+         COALESCE(c.onu_count, 0) AS onu_count,
+         COALESCE(c.link_count, 0) AS link_count
+  FROM sub_areas s
+  JOIN areas a ON a.id = s.area_id
+  JOIN districts d ON d.id = a.district_id
+  LEFT JOIN LATERAL (
+    SELECT
+      (SELECT count(*) FROM tjs t WHERE t.sub_area_id = s.id)::int AS tj_count,
+      (SELECT count(*) FROM olts o WHERE o.sub_area_id = s.id)::int AS olt_count,
+      (SELECT count(*) FROM onus n WHERE n.sub_area_id = s.id)::int AS onu_count,
+      (SELECT count(*) FROM tj_links l WHERE l.sub_area_id = s.id)::int AS link_count
+  ) c ON true
+`;
+
+/** Camera fit for a bounding box: keeps the whole set inside ~60% of the viewport. */export function boundsZoom(
   minLat: number | null,
   maxLat: number | null,
   minLng: number | null,
@@ -213,7 +256,11 @@ export class GeoService {
 
   async network(areaId: string) {
     await this.getArea(areaId);
-    return this.tjs.networkForArea(areaId);
+    const [network, subAreas] = await Promise.all([
+      this.tjs.networkForArea(areaId),
+      this.listSubAreas(areaId),
+    ]);
+    return { ...network, subAreas };
   }
 
   async createArea(districtId: string, dto: CreateAreaDto, userId: string) {
@@ -260,6 +307,103 @@ export class GeoService {
     );
     if (rows.length === 0) throw new NotFoundException('Area not found');
     return { ok: true, id };
+  }
+
+  async listSubAreas(areaId?: string) {
+    const rows = await this.db.query<SubAreaRow>(
+      `${SUB_AREA_SELECT} WHERE ($1::uuid IS NULL OR s.area_id = $1::uuid)
+       ORDER BY a.name ASC, s.name ASC`,
+      [areaId ?? null],
+    );
+    return rows.map((row) => this.mapSubArea(row));
+  }
+
+  async getSubArea(id: string) {
+    const rows = await this.db.query<SubAreaRow>(`${SUB_AREA_SELECT} WHERE s.id = $1`, [id]);
+    if (rows.length === 0) throw new NotFoundException('Sub-area not found');
+    return this.mapSubArea(rows[0]);
+  }
+
+  async createSubArea(areaId: string, dto: CreateSubAreaDto, userId: string) {
+    await this.getAreaRow(areaId);
+    const rows = await guardDuplicate(
+      this.db.query<{ id: string }>(
+        `INSERT INTO sub_areas (area_id, code, name, description, created_by)
+         VALUES ($1, $2, $3, $4, $5) RETURNING id`,
+        [
+          areaId,
+          dto.code ? slugCode(dto.code, 'SUB') : null,
+          dto.name.trim(),
+          dto.description?.trim() || null,
+          userId,
+        ],
+      ),
+      'This area already has a sub-area with that name.',
+    );
+    return this.getSubArea(rows[0].id);
+  }
+
+  async updateSubArea(id: string, dto: UpdateSubAreaDto) {
+    const existing = await this.getSubArea(id);
+    const rows = await guardDuplicate(
+      this.db.query<{ id: string }>(
+        `UPDATE sub_areas SET code = $2, name = $3, description = $4, updated_at = now()
+         WHERE id = $1 RETURNING id`,
+        [
+          id,
+          dto.code !== undefined ? (dto.code ? slugCode(dto.code, 'SUB') : null) : existing.code,
+          dto.name?.trim() || existing.name,
+          dto.description !== undefined ? dto.description?.trim() || null : existing.description,
+        ],
+      ),
+      'This area already has a sub-area with that name.',
+    );
+    return this.getSubArea(rows[0].id);
+  }
+
+  async removeSubArea(id: string) {
+    const exists = await this.db.query<{ id: string }>('SELECT id FROM sub_areas WHERE id = $1', [id]);
+    if (exists.length === 0) throw new NotFoundException('Sub-area not found');
+
+    const tjIds = (
+      await this.db.query<{ id: string }>('SELECT id FROM tjs WHERE sub_area_id = $1', [id])
+    ).map((row) => row.id);
+    const oltIds = (
+      await this.db.query<{ id: string }>('SELECT id FROM olts WHERE sub_area_id = $1', [id])
+    ).map((row) => row.id);
+    const onuIds = (
+      await this.db.query<{ id: string }>('SELECT id FROM onus WHERE sub_area_id = $1', [id])
+    ).map((row) => row.id);
+
+    // Links filed here go too, including any that reach devices outside the
+    // sub-area, so their ports are freed on the devices that survive.
+    const links = await this.db.query<DeviceLinkRow>(
+      `SELECT id, from_tj_id, from_olt_id, from_onu_id, to_tj_id, to_olt_id, to_onu_id
+         FROM tj_links
+        WHERE sub_area_id = $1
+           OR from_tj_id = ANY($2::uuid[]) OR to_tj_id = ANY($2::uuid[])
+           OR from_olt_id = ANY($3::uuid[]) OR to_olt_id = ANY($3::uuid[])
+           OR from_onu_id = ANY($4::uuid[]) OR to_onu_id = ANY($4::uuid[])`,
+      [id, tjIds, oltIds, onuIds],
+    );
+    if (links.length > 0) {
+      await this.db.query('DELETE FROM tj_links WHERE id = ANY($1::uuid[])', [
+        links.map((link) => link.id),
+      ]);
+    }
+
+    await this.db.query('DELETE FROM tjs WHERE sub_area_id = $1', [id]);
+    await this.db.query('DELETE FROM olts WHERE sub_area_id = $1', [id]);
+    await this.db.query('DELETE FROM onus WHERE sub_area_id = $1', [id]);
+    await this.db.query('DELETE FROM sub_areas WHERE id = $1', [id]);
+
+    await releaseLinkCores(this.db, links);
+
+    return {
+      ok: true,
+      id,
+      removed: { tjs: tjIds.length, olts: oltIds.length, onus: onuIds.length, links: links.length },
+    };
   }
 
   private async getDistrictRow(id: string) {
@@ -316,8 +460,26 @@ export class GeoService {
     };
   }
 
-  private bounds(row: AreaRow | DistrictRow) {
-    if (row.min_lat === null || row.max_lat === null || row.min_lng === null || row.max_lng === null) {
+  private mapSubArea(row: SubAreaRow) {
+    return {
+      id: row.id,
+      areaId: row.area_id,
+      areaName: row.area_name,
+      districtId: row.district_id,
+      districtName: row.district_name,
+      code: row.code,
+      name: row.name,
+      description: row.description,
+      tjCount: Number(row.tj_count),
+      oltCount: Number(row.olt_count),
+      onuCount: Number(row.onu_count),
+      linkCount: Number(row.link_count),
+      createdAt: new Date(row.created_at).toISOString(),
+      updatedAt: new Date(row.updated_at).toISOString(),
+    };
+  }
+
+  private bounds(row: AreaRow | DistrictRow) {    if (row.min_lat === null || row.max_lat === null || row.min_lng === null || row.max_lng === null) {
       return null;
     }
     return {

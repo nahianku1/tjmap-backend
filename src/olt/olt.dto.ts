@@ -26,6 +26,13 @@ export class PonPortDto {
   @MaxLength(40)
   label: string;
 
+  /** Optional friendly name shown alongside the hardware port label. */
+  @IsOptional()
+  @ValidateIf((_object, value) => value !== null)
+  @IsString()
+  @MaxLength(60)
+  name?: string | null;
+
   @IsOptional()
   @Type(() => Number)
   @IsNumber()
@@ -96,9 +103,19 @@ export class CreateOltDto {
   @Type(() => EthernetPortDto)
   ethernetPorts?: EthernetPortDto[];
 
+  /** Fibre cable feeding the cabinet. Optional; derived from the connected link when one exists. */
+  @IsOptional()
+  @IsString()
+  @MaxLength(80)
+  fibreId?: string;
+
   @IsOptional()
   @IsUUID()
   areaId?: string | null;
+
+  @IsOptional()
+  @IsUUID()
+  subAreaId?: string | null;
 
   @IsOptional()
   @Type(() => Number)
@@ -155,8 +172,18 @@ export class UpdateOltDto {
   ethernetPorts?: EthernetPortDto[];
 
   @IsOptional()
+  @ValidateIf((_object, value) => value !== null)
+  @IsString()
+  @MaxLength(80)
+  fibreId?: string | null;
+
+  @IsOptional()
   @IsUUID()
   areaId?: string | null;
+
+  @IsOptional()
+  @IsUUID()
+  subAreaId?: string | null;
 
   @IsOptional()
   @Type(() => Number)

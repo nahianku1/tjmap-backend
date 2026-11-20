@@ -12,7 +12,14 @@ import {
   UseGuards,
 } from '@nestjs/common';
 import { GeoService } from './geo.service';
-import { CreateAreaDto, CreateDistrictDto, UpdateAreaDto, UpdateDistrictDto } from './geo.dto';
+import {
+  CreateAreaDto,
+  CreateDistrictDto,
+  CreateSubAreaDto,
+  UpdateAreaDto,
+  UpdateDistrictDto,
+  UpdateSubAreaDto,
+} from './geo.dto';
 import { AuthenticatedRequest, JwtAuthGuard, RolesGuard } from '../auth/auth.guard';
 import { Roles } from '../auth/roles.decorator';
 
@@ -84,5 +91,37 @@ export class GeoController {
   @Roles('admin')
   removeArea(@Param('id', ParseUUIDPipe) id: string) {
     return this.geo.removeArea(id);
+  }
+
+  @Get('sub-areas')
+  listSubAreas(@Query('areaId') areaId?: string) {
+    return this.geo.listSubAreas(areaId);
+  }
+
+  @Get('sub-areas/:id')
+  getSubArea(@Param('id', ParseUUIDPipe) id: string) {
+    return this.geo.getSubArea(id);
+  }
+
+  @Post('areas/:id/sub-areas')
+  @Roles('admin')
+  createSubArea(
+    @Param('id', ParseUUIDPipe) areaId: string,
+    @Body() dto: CreateSubAreaDto,
+    @Req() req: AuthenticatedRequest,
+  ) {
+    return this.geo.createSubArea(areaId, dto, req.user!.id);
+  }
+
+  @Patch('sub-areas/:id')
+  @Roles('admin')
+  updateSubArea(@Param('id', ParseUUIDPipe) id: string, @Body() dto: UpdateSubAreaDto) {
+    return this.geo.updateSubArea(id, dto);
+  }
+
+  @Delete('sub-areas/:id')
+  @Roles('admin')
+  removeSubArea(@Param('id', ParseUUIDPipe) id: string) {
+    return this.geo.removeSubArea(id);
   }
 }

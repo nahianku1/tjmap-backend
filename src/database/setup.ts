@@ -17,6 +17,7 @@ async function migrate() {
   await pool.query(
     `ALTER TABLE tj_links ADD COLUMN IF NOT EXISTS to_core_label text`,
   );
+  await pool.query(`ALTER TABLE onus ALTER COLUMN fibre_id DROP NOT NULL`);
 }
 
 type SeedCore = { label: string; color: string; count: number };

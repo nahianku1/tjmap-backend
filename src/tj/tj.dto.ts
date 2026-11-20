@@ -45,6 +45,12 @@ export class CoreDto {
   @Type(() => Number)
   @IsNumber()
   powerDbm?: number;
+
+  /** Link that currently patches this core; set by the link service, must survive TJ saves. */
+  @IsOptional()
+  @IsString()
+  @MaxLength(80)
+  connectedLinkId?: string | null;
 }
 
 export class SplitterDto {
@@ -312,6 +318,10 @@ export class CreateTjDto {
 
   @IsOptional()
   @IsUUID()
+  subAreaId?: string | null;
+
+  @IsOptional()
+  @IsUUID()
   oltId?: string | null;
 
   @IsOptional()
@@ -425,6 +435,10 @@ export class UpdateTjDto {
 
   @IsOptional()
   @IsUUID()
+  subAreaId?: string | null;
+
+  @IsOptional()
+  @IsUUID()
   oltId?: string | null;
 
   @IsOptional()
@@ -527,6 +541,11 @@ export class CreateLinkDto {
   @MaxLength(40)
   toCoreLabel?: string | null;
 
+  /** Sub-area this span is filed under (organisational only). */
+  @IsOptional()
+  @IsUUID()
+  subAreaId?: string | null;
+
   @Type(() => Number)
   @IsInt()
   @Min(0)
@@ -608,6 +627,10 @@ export class UpdateLinkDto {
   @IsString()
   @MaxLength(40)
   toCoreLabel?: string | null;
+
+  @IsOptional()
+  @IsUUID()
+  subAreaId?: string | null;
 
   @IsOptional()
   @Type(() => Number)

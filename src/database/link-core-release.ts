@@ -50,6 +50,17 @@ function releaseCores(value: unknown, linkIds: Set<string>): unknown[] | null {
   return changed ? next : null;
 }
 
+/** Splitter legs are stored per splitter; they hold links too. */
+function releaseSplitterOutputs(
+  value: unknown,
+  linkIds: Set<string>,
+): Record<string, unknown> | null {
+  if (!value || typeof value !== 'object') return null;
+  const splitter = value as Record<string, unknown>;
+  const outputs = releaseCores(splitter.outputs, linkIds);
+  return outputs ? { ...splitter, outputs } : null;
+}
+
 async function freeEndpointCores(
   db: DatabaseService,
   table: 'tjs' | 'onus',
@@ -57,36 +68,60 @@ async function freeEndpointCores(
   linkIds: Set<string>,
 ) {
   if (ids.length === 0) return;
-  const rows =
-    table === 'tjs'
-      ? await db.query<{ id: string; cores: unknown; output_cores: unknown }>(
-          'SELECT id, cores, output_cores FROM tjs WHERE id = ANY($1::uuid[])',
-          [ids],
-        )
-      : await db.query<{ id: string; cores: unknown; output_cores: unknown }>(
-          'SELECT id, cores FROM onus WHERE id = ANY($1::uuid[])',
-          [ids],
-        );
+  if (table === 'tjs') {
+    const rows = await db.query<{
+      id: string;
+      cores: unknown;
+      output_cores: unknown;
+      splitter: unknown;
+      splitters: unknown;
+    }>(
+      'SELECT id, cores, output_cores, splitter, splitters FROM tjs WHERE id = ANY($1::uuid[])',
+      [ids],
+    );
 
-  for (const row of rows) {
-    const cores = releaseCores(row.cores, linkIds);
-    const outputCores = table === 'tjs' ? releaseCores(row.output_cores, linkIds) : null;
-    if (!cores && !outputCores) continue;
-    if (table === 'tjs') {
+    for (const row of rows) {
+      const cores = releaseCores(row.cores, linkIds);
+      const outputCores = releaseCores(row.output_cores, linkIds);
+      const splitter = releaseSplitterOutputs(row.splitter, linkIds);
+      let splitters: unknown[] | null = null;
+      if (Array.isArray(row.splitters)) {
+        let changed = false;
+        splitters = row.splitters.map((item) => {
+          const updated = releaseSplitterOutputs(item, linkIds);
+          if (updated) changed = true;
+          return updated ?? item;
+        });
+        if (!changed) splitters = null;
+      }
+      if (!cores && !outputCores && !splitter && !splitters) continue;
       await db.query(
-        `UPDATE tjs SET cores = $2::jsonb, output_cores = $3::jsonb, updated_at = now() WHERE id = $1`,
+        `UPDATE tjs SET cores = $2::jsonb, output_cores = $3::jsonb,
+                        splitter = $4::jsonb, splitters = $5::jsonb, updated_at = now()
+         WHERE id = $1`,
         [
           row.id,
           JSON.stringify(cores ?? row.cores ?? []),
           JSON.stringify(outputCores ?? row.output_cores ?? []),
+          JSON.stringify(splitter ?? row.splitter ?? { enabled: false, ratio: null, outputs: [] }),
+          JSON.stringify(splitters ?? row.splitters ?? []),
         ],
       );
-    } else {
-      await db.query(
-        'UPDATE onus SET cores = $2::jsonb, updated_at = now() WHERE id = $1',
-        [row.id, JSON.stringify(cores ?? row.cores ?? [])],
-      );
     }
+    return;
+  }
+
+  const rows = await db.query<{ id: string; cores: unknown }>(
+    'SELECT id, cores FROM onus WHERE id = ANY($1::uuid[])',
+    [ids],
+  );
+  for (const row of rows) {
+    const cores = releaseCores(row.cores, linkIds);
+    if (!cores) continue;
+    await db.query('UPDATE onus SET cores = $2::jsonb, updated_at = now() WHERE id = $1', [
+      row.id,
+      JSON.stringify(cores),
+    ]);
   }
 }
 
@@ -100,18 +135,63 @@ export async function releaseDeletedLinkCores(
   links: DeviceLinkRow[],
   deletedDeviceId: string,
 ) {
+  await freeLinkCores(db, links, new Set([deletedDeviceId]));
+}
+
+/**
+ * Frees every port held by links deleted independently of their endpoints,
+ * e.g. when a sub-area is removed and its links go with it.
+ */
+export async function releaseLinkCores(db: DatabaseService, links: DeviceLinkRow[]) {
+  await freeLinkCores(db, links, new Set());
+}
+
+async function freeLinkCores(
+  db: DatabaseService,
+  links: DeviceLinkRow[],
+  skipDeviceIds: Set<string>,
+) {
   if (links.length === 0) return;
   const linkIds = new Set(links.map((link) => link.id));
   const tjIds = new Set<string>();
   const onuIds = new Set<string>();
   for (const link of links) {
     for (const id of [link.from_tj_id, link.to_tj_id]) {
-      if (id && id !== deletedDeviceId) tjIds.add(id);
+      if (id && !skipDeviceIds.has(id)) tjIds.add(id);
     }
     for (const id of [link.from_onu_id, link.to_onu_id]) {
-      if (id && id !== deletedDeviceId) onuIds.add(id);
+      if (id && !skipDeviceIds.has(id)) onuIds.add(id);
     }
   }
   await freeEndpointCores(db, 'tjs', [...tjIds], linkIds);
   await freeEndpointCores(db, 'onus', [...onuIds], linkIds);
+
+  // Also remove any auto-created user fibres owned by these links from every TJ.
+  // Auto fibres have ids prefixed with `uf-link-<linkId>-`. We query all TJs
+  // that touch these links (by id column), then filter in JS – safe and avoids
+  // dynamic SQL construction.
+  if (linkIds.size === 0) return;
+  const allLinkPrefixes = [...linkIds].map((lid) => `uf-link-${lid}-`);
+  // Build a JSONB existence check for any of the prefixes using pg's @> or just
+  // scan jsonb_array_elements. For safety we pull candidate TJ rows via the
+  // already-known tjIds (which are the TJ endpoints of the dying links).
+  const candidateTjIds = [...tjIds];
+  if (candidateTjIds.length === 0) return;
+  const candidateRows = await db.query<{ id: string; user_fibres: unknown }>(
+    'SELECT id, user_fibres FROM tjs WHERE id = ANY($1::uuid[])',
+    [candidateTjIds],
+  );
+  for (const tjRow of candidateRows) {
+    const list = Array.isArray(tjRow.user_fibres) ? (tjRow.user_fibres as Record<string, unknown>[]) : [];
+    if (list.length === 0) continue;
+    const next = list.filter((fibre) => {
+      const fibreId = String(fibre.id ?? '');
+      return !allLinkPrefixes.some((prefix) => fibreId.startsWith(prefix));
+    });
+    if (next.length === list.length) continue;
+    await db.query('UPDATE tjs SET user_fibres = $2::jsonb, updated_at = now() WHERE id = $1', [
+      tjRow.id,
+      JSON.stringify(next),
+    ]);
+  }
 }

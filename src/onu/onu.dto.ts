@@ -36,6 +36,12 @@ export class OnuCoreDto {
   @IsOptional()
   @IsIn(ONU_CORE_STATUSES)
   status?: (typeof ONU_CORE_STATUSES)[number];
+
+  /** Link that currently patches this core; set by the link service, must survive ONU saves. */
+  @IsOptional()
+  @IsString()
+  @MaxLength(80)
+  connectedLinkId?: string | null;
 }
 
 export class CreateOnuDto {
@@ -55,10 +61,11 @@ export class CreateOnuDto {
   @IsInt()
   vlanId?: number | null;
 
+  /** Drop cable feeding the ONU. Optional; taken from the connected link when one exists. */
+  @IsOptional()
   @IsString()
-  @MinLength(1)
   @MaxLength(60)
-  fibreId: string;
+  fibreId?: string;
 
   @IsOptional()
   @IsIn(PON_TYPES)
@@ -78,6 +85,10 @@ export class CreateOnuDto {
   @IsOptional()
   @IsUUID()
   areaId?: string | null;
+
+  @IsOptional()
+  @IsUUID()
+  subAreaId?: string | null;
 
   @IsOptional()
   @Type(() => Number)
@@ -137,6 +148,10 @@ export class UpdateOnuDto {
   @IsOptional()
   @IsUUID()
   areaId?: string | null;
+
+  @IsOptional()
+  @IsUUID()
+  subAreaId?: string | null;
 
   @IsOptional()
   @Type(() => Number)

@@ -1,5 +1,6 @@
 import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
 import { DatabaseService } from '../database/database.service';
+import { assertSubArea } from '../database/placement';
 import { CreateLinkDto, LinkCoreDto, UpdateLinkDto } from './tj.dto';
 
 type EndpointKind = 'tj' | 'olt' | 'onu';
@@ -59,6 +60,8 @@ interface LinkRow {
   to_core_label: string | null;
   cores: unknown;
   path: unknown;
+  sub_area_id: string | null;
+  sub_area_name: string | null;
   status: string;
   length_m: number | null;
   attenuation_db_per_km: number;
@@ -146,6 +149,7 @@ const LINK_SELECT = `
          ST_X(COALESCE(t.location, o.location, ou.location)::geometry) AS to_lng,
          l.fibre_id, l.cable_type, l.core_count, l.from_core_label, l.to_core_label,
          l.cores, l.path, l.status, l.length_m,
+         l.sub_area_id, sa.name AS sub_area_name,
          l.attenuation_db_per_km, l.splice_count, l.connection_loss_db, l.color,
          l.notes, l.created_at, l.updated_at
   FROM tj_links l
@@ -154,7 +158,8 @@ const LINK_SELECT = `
   LEFT JOIN onus fu ON fu.id = l.from_onu_id
   LEFT JOIN tjs t ON t.id = l.to_tj_id
   LEFT JOIN olts o ON o.id = l.to_olt_id
-  LEFT JOIN onus ou ON ou.id = l.to_onu_id`;
+  LEFT JOIN onus ou ON ou.id = l.to_onu_id
+  LEFT JOIN sub_areas sa ON sa.id = l.sub_area_id`;
 
 function normaliseCores(
   raw: LinkCoreDto[] | undefined,
@@ -230,15 +235,17 @@ export class LinkService {
     const primaryTo = cores.find((core) => core.toCoreLabel)?.toCoreLabel ?? null;
     const path = normalisePath(dto.path);
     const lengthM = routeLengthMeters(from.lat, from.lng, to.lat, to.lng, path);
+    const subAreaId = await assertSubArea(this.db, dto.subAreaId);
 
     const rows = await this.db.query<{ id: string }>(
       `INSERT INTO tj_links (from_tj_id, from_olt_id, from_onu_id,
                              to_tj_id, to_olt_id, to_onu_id,
                              fibre_id, cable_type, core_count, from_core_label, to_core_label,
                              cores, status, notes, created_by, path, length_m,
-                             attenuation_db_per_km, splice_count, connection_loss_db, color)
+                             attenuation_db_per_km, splice_count, connection_loss_db, color,
+                             sub_area_id)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::jsonb, $13, $14, $15,
-               $16::jsonb, $17, $18, $19, $20, $21)
+               $16::jsonb, $17, $18, $19, $20, $21, $22)
        RETURNING id`,
       [
         from.kind === 'tj' ? from.id : null,
@@ -262,6 +269,7 @@ export class LinkService {
         dto.spliceCount ?? 2,
         dto.connectionLossDb ?? 1.0,
         dto.color ?? null,
+        subAreaId,
       ],
     );
 
@@ -269,6 +277,7 @@ export class LinkService {
     await this.syncDeviceCores(rows[0].id, to, cores.map((core) => core.toCoreLabel));
     await this.syncOnuCores(rows[0].id, from, cores.map((core) => core.fromCoreLabel));
     await this.syncOnuCores(rows[0].id, to, cores.map((core) => core.toCoreLabel));
+    await this.syncTjUserFibres(rows[0].id, from, to, cores);
     return this.get(rows[0].id);
   }
 
@@ -291,6 +300,8 @@ export class LinkService {
 
     const path = dto.path !== undefined ? normalisePath(dto.path) : normalisePath(row.path);
     const lengthM = routeLengthMeters(from.lat, from.lng, to.lat, to.lng, path);
+    const subAreaId =
+      dto.subAreaId !== undefined ? await assertSubArea(this.db, dto.subAreaId) : row.sub_area_id;
 
     await this.db.query(
       `UPDATE tj_links SET
@@ -308,6 +319,7 @@ export class LinkService {
          splice_count = $13,
          connection_loss_db = $14,
          color = $15,
+         sub_area_id = $16,
          updated_at = now()
        WHERE id = $1`,
       [
@@ -326,6 +338,7 @@ export class LinkService {
         dto.spliceCount ?? row.splice_count ?? 2,
         dto.connectionLossDb ?? row.connection_loss_db ?? 1.0,
         dto.color !== undefined ? dto.color : row.color,
+        subAreaId,
       ],
     );
 
@@ -333,6 +346,18 @@ export class LinkService {
     await this.syncDeviceCores(id, to, cores.map((core) => core.toCoreLabel));
     await this.syncOnuCores(id, from, cores.map((core) => core.fromCoreLabel));
     await this.syncOnuCores(id, to, cores.map((core) => core.toCoreLabel));
+    await this.syncTjUserFibres(id, from, to, cores);
+
+    // When the link status changes to/from 'cut', immediately propagate the
+    // down/up state to the connected device cores so they reflect it right away.
+    const newStatus = dto.status ?? row.status;
+    const oldStatus = row.status;
+    if (newStatus !== oldStatus && (newStatus === 'cut' || oldStatus === 'cut')) {
+      const targetCoreStatus = newStatus === 'cut' ? 'damaged' : 'in_use';
+      await this.propagateLinkStatusToCores(id, from, cores.map((c) => c.fromCoreLabel), targetCoreStatus);
+      await this.propagateLinkStatusToCores(id, to, cores.map((c) => c.toCoreLabel), targetCoreStatus);
+    }
+
     return this.get(id);
   }
 
@@ -349,6 +374,7 @@ export class LinkService {
     if (to) await this.syncDeviceCores(id, to, []);
     if (from) await this.syncOnuCores(id, from, []);
     if (to) await this.syncOnuCores(id, to, []);
+    await this.removeAutoUserFibres(id);
     return { ok: true, id };
   }
 
@@ -430,10 +456,12 @@ export class LinkService {
   private async syncDeviceCores(linkId: string, endpoint: Endpoint | null, labels: (string | null)[]) {
     if (!endpoint || endpoint.kind !== 'tj') return;
     const wanted = new Set(labels.filter((label): label is string => Boolean(label)));
-    const rows = await this.db.query<{ cores: unknown; output_cores: unknown }>(
-      'SELECT cores, output_cores FROM tjs WHERE id = $1',
-      [endpoint.id],
-    );
+    const rows = await this.db.query<{
+      cores: unknown;
+      output_cores: unknown;
+      splitter: unknown;
+      splitters: unknown;
+    }>('SELECT cores, output_cores, splitter, splitters FROM tjs WHERE id = $1', [endpoint.id]);
     if (rows.length === 0) return;
     const row = rows[0];
 
@@ -461,17 +489,40 @@ export class LinkService {
       });
       return changed ? next : null;
     };
+    // Splitter legs live in their own JSON too; the map's port picker reads
+    // those statuses, so a cable on a leg has to show there as well.
+    const applySplitterOutputs = (value: unknown): Record<string, unknown> | null => {
+      if (!value || typeof value !== 'object') return null;
+      const splitter = value as Record<string, unknown>;
+      const outputs = apply(splitter.outputs);
+      return outputs ? { ...splitter, outputs } : null;
+    };
 
     const cores = apply(row.cores);
     const outputCores = apply(row.output_cores);
-    if (!cores && !outputCores) return;
+    const splitter = applySplitterOutputs(row.splitter);
+    let splitters: unknown[] | null = null;
+    if (Array.isArray(row.splitters)) {
+      let changed = false;
+      splitters = row.splitters.map((item) => {
+        const updated = applySplitterOutputs(item);
+        if (updated) changed = true;
+        return updated ?? item;
+      });
+      if (!changed) splitters = null;
+    }
+    if (!cores && !outputCores && !splitter && !splitters) return;
 
     await this.db.query(
-      `UPDATE tjs SET cores = $2::jsonb, output_cores = $3::jsonb, updated_at = now() WHERE id = $1`,
+      `UPDATE tjs SET cores = $2::jsonb, output_cores = $3::jsonb,
+                      splitter = $4::jsonb, splitters = $5::jsonb, updated_at = now()
+       WHERE id = $1`,
       [
         endpoint.id,
         JSON.stringify(cores ?? row.cores ?? []),
         JSON.stringify(outputCores ?? row.output_cores ?? []),
+        JSON.stringify(splitter ?? row.splitter ?? { enabled: false, ratio: null, outputs: [] }),
+        JSON.stringify(splitters ?? row.splitters ?? []),
       ],
     );
   }
@@ -512,6 +563,284 @@ export class LinkService {
     ]);
   }
 
+  /**
+   * Propagates the link's operational status to the connected device cores.
+   * When a link is cut, cores it owns are flipped to 'damaged' so the UI
+   * immediately shows the fault. When restored to 'active', they go back to
+   * 'in_use'. Only cores that are already owned by this link are touched.
+   */
+  private async propagateLinkStatusToCores(
+    linkId: string,
+    endpoint: Endpoint | null,
+    labels: (string | null)[],
+    coreStatus: 'damaged' | 'in_use',
+  ) {
+    if (!endpoint) return;
+    const wanted = new Set(labels.filter((l): l is string => Boolean(l)));
+    if (wanted.size === 0) return;
+
+    if (endpoint.kind === 'tj') {
+      const rows = await this.db.query<{
+        cores: unknown;
+        output_cores: unknown;
+        splitter: unknown;
+        splitters: unknown;
+      }>('SELECT cores, output_cores, splitter, splitters FROM tjs WHERE id = $1', [endpoint.id]);
+      if (rows.length === 0) return;
+      const row = rows[0];
+
+      const applyStatus = (value: unknown) => {
+        const list = Array.isArray(value) ? value : [];
+        let changed = false;
+        const next = list.map((item) => {
+          const core = (item ?? {}) as Record<string, unknown> & {
+            label?: string;
+            status?: string;
+            connectedLinkId?: string;
+          };
+          if (
+            core.connectedLinkId === linkId &&
+            Boolean(core.label) &&
+            wanted.has(String(core.label)) &&
+            core.status !== coreStatus
+          ) {
+            changed = true;
+            return { ...core, status: coreStatus };
+          }
+          return core;
+        });
+        return changed ? next : null;
+      };
+
+      const applyStatusSplitter = (value: unknown): Record<string, unknown> | null => {
+        if (!value || typeof value !== 'object') return null;
+        const sp = value as Record<string, unknown>;
+        const outputs = applyStatus(sp.outputs);
+        return outputs ? { ...sp, outputs } : null;
+      };
+
+      const cores = applyStatus(row.cores);
+      const outputCores = applyStatus(row.output_cores);
+      const splitter = applyStatusSplitter(row.splitter);
+      let splitters: unknown[] | null = null;
+      if (Array.isArray(row.splitters)) {
+        let changed = false;
+        splitters = row.splitters.map((item) => {
+          const updated = applyStatusSplitter(item);
+          if (updated) changed = true;
+          return updated ?? item;
+        });
+        if (!changed) splitters = null;
+      }
+      if (!cores && !outputCores && !splitter && !splitters) return;
+      await this.db.query(
+        `UPDATE tjs SET cores = $2::jsonb, output_cores = $3::jsonb,
+                        splitter = $4::jsonb, splitters = $5::jsonb, updated_at = now()
+         WHERE id = $1`,
+        [
+          endpoint.id,
+          JSON.stringify(cores ?? row.cores ?? []),
+          JSON.stringify(outputCores ?? row.output_cores ?? []),
+          JSON.stringify(splitter ?? row.splitter ?? { enabled: false, ratio: null, outputs: [] }),
+          JSON.stringify(splitters ?? row.splitters ?? []),
+        ],
+      );
+      return;
+    }
+
+    if (endpoint.kind === 'onu') {
+      const rows = await this.db.query<{ cores: unknown }>('SELECT cores FROM onus WHERE id = $1', [endpoint.id]);
+      if (rows.length === 0) return;
+      const list = Array.isArray(rows[0].cores) ? rows[0].cores : [];
+      let changed = false;
+      const next = list.map((item) => {
+        const core = (item ?? {}) as Record<string, unknown> & {
+          label?: string;
+          status?: string;
+          connectedLinkId?: string;
+        };
+        if (
+          core.connectedLinkId === linkId &&
+          Boolean(core.label) &&
+          wanted.has(String(core.label)) &&
+          core.status !== coreStatus
+        ) {
+          changed = true;
+          return { ...core, status: coreStatus };
+        }
+        return core;
+      });
+      if (!changed) return;
+      await this.db.query('UPDATE onus SET cores = $2::jsonb, updated_at = now() WHERE id = $1', [
+        endpoint.id,
+        JSON.stringify(next),
+      ]);
+    }
+  }
+
+  /**
+   * When a link patches an ONU onto a joint's splitter leg, the drop cable is
+   * recorded on the joint as a user fibre joined to that leg, mirroring the
+   * ONU cores the link carries. Fibres created here are owned by the link
+   * (id prefix `uf-link-<linkId>-`) and are dropped when it stops carrying them.
+   */
+  private async syncTjUserFibres(linkId: string, from: Endpoint, to: Endpoint, cores: LinkCore[]) {
+    const prefix = `uf-link-${linkId}-`;
+    const pairs: { tj: Endpoint; onu: Endpoint; tjSide: 'from' | 'to' }[] = [];
+    if (from.kind === 'tj' && to.kind === 'onu') pairs.push({ tj: from, onu: to, tjSide: 'from' });
+    if (to.kind === 'tj' && from.kind === 'onu') pairs.push({ tj: to, onu: from, tjSide: 'to' });
+
+    const touched = new Set<string>();
+    for (const { tj, onu, tjSide } of pairs) {
+      const tjRows = await this.db.query<{ splitter: unknown; splitters: unknown; user_fibres: unknown }>(
+        'SELECT splitter, splitters, user_fibres FROM tjs WHERE id = $1',
+        [tj.id],
+      );
+      if (tjRows.length === 0) continue;
+      const row = tjRows[0];
+      touched.add(tj.id);
+
+      const legLabels = new Set<string>();
+      const collectLegs = (value: unknown) => {
+        if (!value || typeof value !== 'object') return;
+        const outputs = (value as { outputs?: unknown }).outputs;
+        if (!Array.isArray(outputs)) return;
+        for (const output of outputs) {
+          const label = (output as { label?: unknown } | null)?.label;
+          if (typeof label === 'string' && label) legLabels.add(label);
+        }
+      };
+      collectLegs(row.splitter);
+      if (Array.isArray(row.splitters)) row.splitters.forEach(collectLegs);
+
+      const groups = new Map<string, { strandIndex: number; onuLabel: string }[]>();
+      if (legLabels.size > 0) {
+        cores.forEach((core, index) => {
+          const tjLabel = tjSide === 'from' ? core.fromCoreLabel : core.toCoreLabel;
+          const onuLabel = tjSide === 'from' ? core.toCoreLabel : core.fromCoreLabel;
+          if (!tjLabel || !onuLabel || !legLabels.has(tjLabel)) return;
+          const strands = groups.get(tjLabel) ?? [];
+          strands.push({ strandIndex: index + 1, onuLabel });
+          groups.set(tjLabel, strands);
+        });
+      }
+
+      const existing = Array.isArray(row.user_fibres)
+        ? (row.user_fibres as Record<string, unknown>[])
+        : [];
+      const next = existing.filter((fibre) => !String(fibre.id ?? '').startsWith(prefix));
+      const previousOwned = new Map(
+        existing
+          .filter((fibre) => String(fibre.id ?? '').startsWith(prefix))
+          .map((fibre) => [String(fibre.id), fibre]),
+      );
+
+      if (groups.size > 0) {
+        const onuRows = await this.db.query<{ cores: unknown }>('SELECT cores FROM onus WHERE id = $1', [
+          onu.id,
+        ]);
+        const onuCoreByLabel = new Map<string, { label?: string; color?: string }>();
+        if (onuRows.length > 0 && Array.isArray(onuRows[0].cores)) {
+          for (const core of onuRows[0].cores) {
+            const entry = (core ?? {}) as { label?: unknown; color?: unknown };
+            if (typeof entry.label === 'string' && entry.label) {
+              onuCoreByLabel.set(entry.label, {
+                label: entry.label,
+                color: typeof entry.color === 'string' ? entry.color : undefined,
+              });
+            }
+          }
+        }
+
+        for (const [tjLabel, strands] of groups) {
+          const id = `${prefix}${strands[0].strandIndex}`;
+          const previous = previousOwned.get(id) ?? null;
+          const fibreCores = strands.map((strand, coreIndex) => {
+            const onuCore = onuCoreByLabel.get(strand.onuLabel);
+            return {
+              coreIndex: coreIndex + 1,
+              label: onuCore?.label ?? strand.onuLabel,
+              color: onuCore?.color ?? '#0284c7',
+              status: 'in_use',
+              connectedToOutputCore: true,
+            };
+          });
+          const baseLabel =
+            previous && typeof previous.label === 'string' && previous.label
+              ? previous.label
+              : onu.code;
+          let label = baseLabel;
+          let suffix = 2;
+          while (
+            next.some(
+              (fibre) => fibre.outputCoreLabel === tjLabel && fibre.label === label,
+            )
+          ) {
+            label = `${baseLabel}-${suffix}`;
+            suffix += 1;
+          }
+          next.push({
+            id,
+            outputCoreLabel: tjLabel,
+            label,
+            color: previous && typeof previous.color === 'string' ? previous.color : '#0284c7',
+            coreCount: fibreCores.length,
+            connectedCoreIndex: 1,
+            cores: fibreCores,
+          });
+        }
+      }
+
+      if (JSON.stringify(next) === JSON.stringify(existing)) continue;
+      await this.db.query('UPDATE tjs SET user_fibres = $2::jsonb, updated_at = now() WHERE id = $1', [
+        tj.id,
+        JSON.stringify(next),
+      ]);
+    }
+
+    // Joints that still hold this link's fibres but no longer carry them.
+    const staleRows = await this.db.query<{ id: string; user_fibres: unknown }>(
+      `SELECT id, user_fibres FROM tjs
+        WHERE EXISTS (
+          SELECT 1 FROM jsonb_array_elements(user_fibres) fibre
+          WHERE fibre->>'id' LIKE $1
+        )`,
+      [`${prefix}%`],
+    );
+    for (const row of staleRows) {
+      if (touched.has(row.id)) continue;
+      const list = Array.isArray(row.user_fibres) ? (row.user_fibres as Record<string, unknown>[]) : [];
+      const next = list.filter((fibre) => !String(fibre.id ?? '').startsWith(prefix));
+      if (next.length === list.length) continue;
+      await this.db.query('UPDATE tjs SET user_fibres = $2::jsonb, updated_at = now() WHERE id = $1', [
+        row.id,
+        JSON.stringify(next),
+      ]);
+    }
+  }
+
+  /** Drops the user fibres a link auto-created, on every joint that holds them. */
+  private async removeAutoUserFibres(linkId: string) {
+    const prefix = `uf-link-${linkId}-`;
+    const rows = await this.db.query<{ id: string; user_fibres: unknown }>(
+      `SELECT id, user_fibres FROM tjs
+        WHERE EXISTS (
+          SELECT 1 FROM jsonb_array_elements(user_fibres) fibre
+          WHERE fibre->>'id' LIKE $1
+        )`,
+      [`${prefix}%`],
+    );
+    for (const row of rows) {
+      const list = Array.isArray(row.user_fibres) ? (row.user_fibres as Record<string, unknown>[]) : [];
+      const next = list.filter((fibre) => !String(fibre.id ?? '').startsWith(prefix));
+      if (next.length === list.length) continue;
+      await this.db.query('UPDATE tjs SET user_fibres = $2::jsonb, updated_at = now() WHERE id = $1', [
+        row.id,
+        JSON.stringify(next),
+      ]);
+    }
+  }
+
   private mapLink(row: LinkRow) {
     return {
       id: row.id,
@@ -538,6 +867,8 @@ export class LinkService {
       toCoreLabel: row.to_core_label ?? null,
       cores: parseStoredCores(row.cores),
       path: normalisePath(row.path),
+      subAreaId: row.sub_area_id,
+      subAreaName: row.sub_area_name,
       status: row.status,
       lengthM: row.length_m === null ? null : Number(row.length_m),
       attenuationDbPerKm:

@@ -2,6 +2,7 @@ import { BadRequestException, Injectable, NotFoundException } from '@nestjs/comm
 import { DatabaseService } from '../database/database.service';
 import { linksTouching, releaseDeletedLinkCores } from '../database/link-core-release';
 import { guardDuplicate } from '../database/pg-errors';
+import { resolvePlacement } from '../database/placement';
 import { OltService } from '../olt/olt.service';
 import { OnuService } from '../onu/onu.service';
 import { CreateTjDto, UpdateTjDto } from './tj.dto';
@@ -29,6 +30,8 @@ interface TjRow {
   user_fibres: unknown;
   area_id: string | null;
   area_name: string | null;
+  sub_area_id: string | null;
+  sub_area_name: string | null;
   district_id: string | null;
   district_name: string | null;
   olt_id: string | null;
@@ -63,6 +66,8 @@ interface LinkRow {
   to_core_label: string | null;
   cores: unknown;
   path: unknown;
+  sub_area_id: string | null;
+  sub_area_name: string | null;
   status: string;
   length_m: number | null;
   attenuation_db_per_km: number;
@@ -83,12 +88,14 @@ const TJ_SELECT = `
          t.is_cut, t.cut_reason, t.cut_severity,
          t.cut_data, t.pon_data, t.user_fibres,
          t.area_id, a.name AS area_name, a.district_id, d.name AS district_name,
+         t.sub_area_id, sa.name AS sub_area_name,
          t.olt_id, o.code AS olt_code, o.name AS olt_name,
          o.pon_port AS olt_pon_port, o.uplink_port AS olt_uplink_port,
          t.created_at, t.updated_at
   FROM tjs t
   LEFT JOIN areas a ON a.id = t.area_id
   LEFT JOIN districts d ON d.id = a.district_id
+  LEFT JOIN sub_areas sa ON sa.id = t.sub_area_id
   LEFT JOIN olts o ON o.id = t.olt_id`;
 
 const LINK_SELECT = `
@@ -104,6 +111,7 @@ const LINK_SELECT = `
          ST_X(COALESCE(t.location, o.location, ou.location)::geometry) AS to_lng,
          l.fibre_id, l.cable_type, l.core_count, l.from_core_label, l.to_core_label,
          l.cores, l.path, l.status, l.length_m,
+         l.sub_area_id, s.name AS sub_area_name,
          l.attenuation_db_per_km, l.splice_count, l.connection_loss_db, l.color,
          l.notes, l.created_at, l.updated_at
   FROM tj_links l
@@ -112,7 +120,8 @@ const LINK_SELECT = `
   LEFT JOIN onus fu ON fu.id = l.from_onu_id
   LEFT JOIN tjs t ON t.id = l.to_tj_id
   LEFT JOIN olts o ON o.id = l.to_olt_id
-  LEFT JOIN onus ou ON ou.id = l.to_onu_id`;
+  LEFT JOIN onus ou ON ou.id = l.to_onu_id
+  LEFT JOIN sub_areas s ON s.id = l.sub_area_id`;
 
 @Injectable()
 export class TjService {
@@ -175,7 +184,7 @@ export class TjService {
   }
 
   async create(dto: CreateTjDto, userId: string) {
-    await this.assertArea(dto.areaId);
+    const placement = await resolvePlacement(this.db, dto.areaId, dto.subAreaId);
     await this.assertOlt(dto.oltId);
     const tjType = dto.tjType ?? (dto.isCut ? 'cut' : 'box');
     const isCut = tjType === 'cut' || dto.isCut === true;
@@ -185,10 +194,10 @@ export class TjService {
       `INSERT INTO tjs (code, name, tj_type, location, address, notes, fibre_id,
                         input_power_dbm, cores, output_cores, splitter,
                         is_cut, cut_reason, cut_severity, cut_data, pon_data, area_id, user_fibres, created_by, olt_id,
-                        splitters)
+                        splitters, sub_area_id)
        VALUES ($1, $2, $3, ST_SetSRID(ST_MakePoint($4, $5), 4326)::geography, $6, $7, $8,
                $9, $10::jsonb, $11::jsonb, $12::jsonb, $13, $14, $15, $16::jsonb, $17::jsonb, $18, $19::jsonb, $20, $21,
-               $22::jsonb)
+               $22::jsonb, $23)
        RETURNING id`,
       [
         dto.code.trim().toUpperCase(),
@@ -208,11 +217,12 @@ export class TjService {
         dto.cutSeverity ?? null,
         JSON.stringify(dto.cutData ?? {}),
         JSON.stringify(dto.ponData ?? {}),
-        dto.areaId ?? null,
+        placement.areaId,
         JSON.stringify(dto.userFibres ?? []),
         userId,
         dto.oltId ?? null,
         JSON.stringify(dto.splitters ?? (dto.splitter ? [dto.splitter] : [])),
+        placement.subAreaId,
       ],
     ),
       'A terminal joint with this code already exists.',
@@ -222,7 +232,11 @@ export class TjService {
 
   async update(id: string, dto: UpdateTjDto) {
     const existing = await this.get(id);
-    await this.assertArea(dto.areaId);
+    const placement = await resolvePlacement(
+      this.db,
+      dto.areaId !== undefined ? dto.areaId : existing.areaId,
+      dto.subAreaId !== undefined ? dto.subAreaId : existing.subAreaId,
+    );
     await this.assertOlt(dto.oltId);
 
     const tjType = dto.tjType ?? existing.tjType ?? (dto.isCut ? 'cut' : 'box');
@@ -251,6 +265,7 @@ export class TjService {
          user_fibres = $20::jsonb,
          olt_id = $21,
          splitters = $22::jsonb,
+         sub_area_id = $23,
          updated_at = now()
        WHERE id = $1
        RETURNING id`,
@@ -277,7 +292,7 @@ export class TjService {
         !isCut ? null : (dto.cutSeverity ?? existing.cutSeverity),
         JSON.stringify(dto.cutData ?? existing.cutData ?? {}),
         JSON.stringify(dto.ponData ?? existing.ponData ?? {}),
-        dto.areaId !== undefined ? dto.areaId ?? null : existing.areaId,
+        placement.areaId,
         JSON.stringify(dto.userFibres ?? (existing as any).userFibres ?? []),
         dto.oltId !== undefined ? dto.oltId ?? null : existing.oltId,
         JSON.stringify(
@@ -285,18 +300,13 @@ export class TjService {
             (existing as any).splitters ??
             (existing.splitter ? [existing.splitter] : []),
         ),
+        placement.subAreaId,
       ],
     ),
       'A terminal joint with this code already exists.',
     );
 
     return this.get(rows[0].id);
-  }
-
-  private async assertArea(areaId?: string | null) {
-    if (!areaId) return;
-    const rows = await this.db.query<{ id: string }>('SELECT id FROM areas WHERE id = $1', [areaId]);
-    if (rows.length === 0) throw new BadRequestException('That area no longer exists.');
   }
 
   private async assertOlt(oltId?: string | null) {
@@ -346,6 +356,8 @@ export class TjService {
       userFibres: (row.user_fibres as any) ?? [],
       areaId: row.area_id,
       areaName: row.area_name,
+      subAreaId: row.sub_area_id,
+      subAreaName: row.sub_area_name,
       districtId: row.district_id,
       districtName: row.district_name,
       oltId: row.olt_id,
@@ -395,6 +407,8 @@ export class TjService {
       toCoreLabel: row.to_core_label ?? null,
       cores: Array.isArray(row.cores) ? row.cores : [],
       path: Array.isArray(row.path) ? row.path : [],
+      subAreaId: row.sub_area_id,
+      subAreaName: row.sub_area_name,
       status: row.status,
       lengthM: row.length_m === null ? null : Number(row.length_m),
       attenuationDbPerKm:

@@ -1,6 +1,7 @@
 import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
 import { DatabaseService } from '../database/database.service';
 import { linksTouching, releaseDeletedLinkCores } from '../database/link-core-release';
+import { resolvePlacement } from '../database/placement';
 import {
   CreateOnuDto,
   ONU_CLASSES,
@@ -22,13 +23,15 @@ interface OnuRow {
   username: string;
   mac_address: string | null;
   vlan_id: number | null;
-  fibre_id: string;
+  fibre_id: string | null;
   pon_type: string;
   onu_class: string;
   cores: unknown;
   notes: string | null;
   area_id: string | null;
   area_name: string | null;
+  sub_area_id: string | null;
+  sub_area_name: string | null;
   district_id: string | null;
   district_name: string | null;
   lat: number | null;
@@ -41,12 +44,14 @@ const ONU_SELECT = `
   SELECT o.id, o.username, o.mac_address, o.vlan_id, o.fibre_id, o.pon_type, o.onu_class,
          o.cores, o.notes,
          o.area_id, a.name AS area_name, a.district_id, d.name AS district_name,
+         o.sub_area_id, sa.name AS sub_area_name,
          ST_Y(o.location::geometry) AS lat,
          ST_X(o.location::geometry) AS lng,
          o.created_at, o.updated_at
   FROM onus o
   LEFT JOIN areas a ON a.id = o.area_id
-  LEFT JOIN districts d ON d.id = a.district_id`;
+  LEFT JOIN districts d ON d.id = a.district_id
+  LEFT JOIN sub_areas sa ON sa.id = o.sub_area_id`;
 
 const FALLBACK_COLORS = [
   '#22d3ee',
@@ -116,31 +121,32 @@ export class OnuService {
   }
 
   async create(dto: CreateOnuDto, userId: string) {
-    await this.assertArea(dto.areaId);
+    const placement = await resolvePlacement(this.db, dto.areaId, dto.subAreaId);
     this.assertLocation(dto.lat, dto.lng);
     this.assertVlan(dto.vlanId);
 
     const rows = await this.db.query<{ id: string }>(
       `       INSERT INTO onus (username, mac_address, vlan_id, fibre_id, pon_type, onu_class,
-                         cores, notes, area_id, location, created_by)
+                         cores, notes, area_id, location, created_by, sub_area_id)
        VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9,
                CASE WHEN $10::double precision IS NULL THEN NULL
                     ELSE ST_SetSRID(ST_MakePoint($11, $10), 4326)::geography END,
-               $12)
+               $12, $13)
        RETURNING id`,
       [
         dto.username.trim(),
         dto.macAddress?.trim() || null,
         dto.vlanId ?? null,
-        dto.fibreId.trim(),
+        dto.fibreId?.trim() || null,
         dto.ponType ?? 'gpon',
         dto.onuClass ?? 'B+',
         JSON.stringify(normaliseCores(dto.cores)),
         dto.notes?.trim() || null,
-        dto.areaId ?? null,
+        placement.areaId,
         dto.lat ?? null,
         dto.lng ?? null,
         userId,
+        placement.subAreaId,
       ],
     );
     return this.get(rows[0].id);
@@ -148,7 +154,11 @@ export class OnuService {
 
   async update(id: string, dto: UpdateOnuDto) {
     const existing = await this.get(id);
-    if (dto.areaId !== undefined) await this.assertArea(dto.areaId);
+    const placement = await resolvePlacement(
+      this.db,
+      dto.areaId !== undefined ? dto.areaId : existing.areaId,
+      dto.subAreaId !== undefined ? dto.subAreaId : existing.subAreaId,
+    );
     this.assertLocation(dto.lat ?? existing.lat ?? undefined, dto.lng ?? existing.lng ?? undefined);
     if (dto.vlanId !== undefined) this.assertVlan(dto.vlanId);
 
@@ -179,6 +189,7 @@ export class OnuService {
          area_id = $10,
          location = CASE WHEN $11::double precision IS NULL THEN NULL
                          ELSE ST_SetSRID(ST_MakePoint($12, $11), 4326)::geography END,
+         sub_area_id = $13,
          updated_at = now()
        WHERE id = $1
        RETURNING id`,
@@ -192,9 +203,10 @@ export class OnuService {
         dto.onuClass ?? existing.onuClass ?? 'B+',
         JSON.stringify(cores),
         dto.notes !== undefined ? dto.notes?.trim() || null : existing.notes,
-        dto.areaId !== undefined ? dto.areaId ?? null : existing.areaId,
+        placement.areaId,
         lat,
         lng,
+        placement.subAreaId,
       ],
     );
     return this.get(rows[0].id);
@@ -206,12 +218,6 @@ export class OnuService {
     if (rows.length === 0) throw new NotFoundException('ONU not found');
     await releaseDeletedLinkCores(this.db, links, id);
     return { ok: true, id };
-  }
-
-  private async assertArea(areaId?: string | null) {
-    if (!areaId) return;
-    const rows = await this.db.query<{ id: string }>('SELECT id FROM areas WHERE id = $1', [areaId]);
-    if (rows.length === 0) throw new BadRequestException('That area no longer exists.');
   }
 
   private assertLocation(lat?: number, lng?: number) {
@@ -244,6 +250,8 @@ export class OnuService {
       notes: row.notes,
       areaId: row.area_id,
       areaName: row.area_name,
+      subAreaId: row.sub_area_id,
+      subAreaName: row.sub_area_name,
       districtId: row.district_id,
       districtName: row.district_name,
       lat: row.lat === null ? null : Number(row.lat),
