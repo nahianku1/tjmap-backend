@@ -4,6 +4,7 @@ import { linksTouching, releaseDeletedLinkCores } from '../database/link-core-re
 import { guardDuplicate } from '../database/pg-errors';
 import { resolvePlacement } from '../database/placement';
 import { CreateOltDto, ETHERNET_SPEEDS, UpdateOltDto } from './olt.dto';
+import { ponOnuCapacity, ponOnuUsage } from './pon-capacity';
 
 export interface PonPort {
   label: string;
@@ -29,6 +30,7 @@ interface OltRow {
   id: string;
   code: string;
   name: string;
+  olt_type: string | null;
   pon_port: string | null;
   uplink_port: string | null;
   pon_ports: unknown;
@@ -49,7 +51,7 @@ interface OltRow {
 }
 
 const OLT_SELECT = `
-  SELECT o.id, o.code, o.name, o.pon_port, o.uplink_port,
+  SELECT o.id, o.code, o.name, o.olt_type, o.pon_port, o.uplink_port,
          o.pon_ports, o.ethernet_ports, o.fibre_id, o.notes,
          o.area_id, a.name AS area_name, a.district_id, d.name AS district_name,
          o.sub_area_id, sa.name AS sub_area_name,
@@ -144,15 +146,16 @@ export class OltService {
       `${OLT_SELECT} WHERE ($1::uuid IS NULL OR o.area_id = $1::uuid) ORDER BY o.name ASC`,
       [areaId ?? null],
     );
-    const usage = await this.portUsage(rows.map((row) => row.id));
-    return rows.map((row) => this.map(row, usage.get(row.id)));
+    const ids = rows.map((row) => row.id);
+    const [usage, onuUsage] = await Promise.all([this.portUsage(ids), ponOnuUsage(this.db, ids)]);
+    return rows.map((row) => this.map(row, usage.get(row.id), onuUsage.get(row.id)));
   }
 
   async get(id: string) {
     const rows = await this.db.query<OltRow>(`${OLT_SELECT} WHERE o.id = $1`, [id]);
     if (rows.length === 0) throw new NotFoundException('OLT not found');
-    const usage = await this.portUsage([id]);
-    return this.map(rows[0], usage.get(id));
+    const [usage, onuUsage] = await Promise.all([this.portUsage([id]), ponOnuUsage(this.db, [id])]);
+    return this.map(rows[0], usage.get(id), onuUsage.get(id));
   }
 
   /**
@@ -203,6 +206,7 @@ export class OltService {
     const placement = await resolvePlacement(this.db, dto.areaId, dto.subAreaId);
     this.assertLocation(dto.lat, dto.lng);
 
+    const oltType = dto.oltType?.trim() || 'gpon';
     const ponPorts = normalisePonPorts(dto.ponPorts);
     const ethernetPorts = normaliseEthernetPorts(dto.ethernetPorts);
     const primaryPon = dto.ponPort?.trim() || ponPorts[0]?.label || null;
@@ -212,15 +216,16 @@ export class OltService {
 
     const rows = await guardDuplicate(
       this.db.query<{ id: string }>(
-        `INSERT INTO olts (code, name, pon_port, uplink_port, pon_ports, ethernet_ports, fibre_id, notes, area_id, location, created_by, sub_area_id)
-         VALUES ($1, $2, $3, $4, $5::jsonb, $6::jsonb, $7, $8, $9,
-                 CASE WHEN $10::double precision IS NULL THEN NULL
-                      ELSE ST_SetSRID(ST_MakePoint($11, $10), 4326)::geography END,
-                 $12, $13)
+        `INSERT INTO olts (code, name, olt_type, pon_port, uplink_port, pon_ports, ethernet_ports, fibre_id, notes, area_id, location, created_by, sub_area_id)
+         VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7::jsonb, $8, $9, $10,
+                 CASE WHEN $11::double precision IS NULL THEN NULL
+                      ELSE ST_SetSRID(ST_MakePoint($12, $11), 4326)::geography END,
+                 $13, $14)
          RETURNING id`,
         [
           slugCode(dto.code ?? dto.name, 'OLT'),
           dto.name.trim(),
+          oltType,
           primaryPon,
           uplinkPort,
           JSON.stringify(ponPorts),
@@ -251,6 +256,7 @@ export class OltService {
     const lat = dto.lat ?? existing.lat;
     const lng = dto.lng ?? existing.lng;
 
+    const oltType = dto.oltType !== undefined ? dto.oltType.trim() || 'gpon' : existing.oltType;
     const ponPorts = dto.ponPorts !== undefined ? normalisePonPorts(dto.ponPorts) : existing.ponPorts;
     const ethernetPorts =
       dto.ethernetPorts !== undefined ? normaliseEthernetPorts(dto.ethernetPorts) : existing.ethernetPorts;
@@ -271,16 +277,17 @@ export class OltService {
         `UPDATE olts SET
            code = $2,
            name = $3,
-           pon_port = $4,
-           uplink_port = $5,
-           pon_ports = $6::jsonb,
-           ethernet_ports = $7::jsonb,
-           fibre_id = $8,
-           notes = $9,
-           area_id = $10,
-           location = CASE WHEN $11::double precision IS NULL THEN NULL
-                           ELSE ST_SetSRID(ST_MakePoint($12, $11), 4326)::geography END,
-           sub_area_id = $13,
+           olt_type = $4,
+           pon_port = $5,
+           uplink_port = $6,
+           pon_ports = $7::jsonb,
+           ethernet_ports = $8::jsonb,
+           fibre_id = $9,
+           notes = $10,
+           area_id = $11,
+           location = CASE WHEN $12::double precision IS NULL THEN NULL
+                           ELSE ST_SetSRID(ST_MakePoint($13, $12), 4326)::geography END,
+           sub_area_id = $14,
            updated_at = now()
          WHERE id = $1
          RETURNING id`,
@@ -288,6 +295,7 @@ export class OltService {
           id,
           dto.code ? slugCode(dto.code, existing.code) : existing.code,
           dto.name?.trim() || existing.name,
+          oltType,
           primaryPon,
           uplinkPort,
           JSON.stringify(ponPorts),
@@ -305,6 +313,9 @@ export class OltService {
     return this.get(rows[0].id);
   }
 
+
+
+
   async remove(id: string) {
     const links = await linksTouching(this.db, 'olt', id);
     const rows = await this.db.query<{ id: string }>('DELETE FROM olts WHERE id = $1 RETURNING id', [id]);
@@ -319,13 +330,28 @@ export class OltService {
     }
   }
 
-  private map(row: OltRow, counts?: Map<string, number>) {
+  private map(
+    row: OltRow,
+    counts?: Map<string, number>,
+    onuCounts?: Map<string, number>,
+  ) {
     const used = counts ?? new Map<string, number>();
+    const onus = onuCounts ?? new Map<string, number>();
     const inherited = used.get('') ?? 0;
+    // GPON-class ports carry 128 subscribers, EPON ports 64; a full port takes no more.
+    const capacity = ponOnuCapacity(row.olt_type);
     const ponPorts = normalisePonPorts(row.pon_ports).map((port) => {
       const explicit = used.get(port.label.trim().toLowerCase()) ?? 0;
       const joints = explicit + (row.pon_port && port.label === row.pon_port ? inherited : 0);
-      return { ...port, joints, status: joints > 0 ? 'in_use' : 'free' };
+      const onuCount = onus.get(port.label.trim().toLowerCase()) ?? 0;
+      return {
+        ...port,
+        joints,
+        onus: onuCount,
+        capacity,
+        full: onuCount >= capacity,
+        status: joints > 0 ? 'in_use' : 'free',
+      };
     });
     const uplink = row.uplink_port?.toLowerCase() ?? '';
     const ethernetPorts = normaliseEthernetPorts(row.ethernet_ports).map((port) => ({
@@ -336,6 +362,7 @@ export class OltService {
       id: row.id,
       code: row.code,
       name: row.name,
+      oltType: row.olt_type || 'gpon',
       ponPort: row.pon_port,
       uplinkPort: row.uplink_port,
       ponPorts,

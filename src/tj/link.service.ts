@@ -1,6 +1,8 @@
 import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
 import { DatabaseService } from '../database/database.service';
 import { assertSubArea } from '../database/placement';
+import { ONU_PORT_LABEL } from '../onu/onu.dto';
+import { assertPonOnuCapacity } from '../olt/pon-capacity';
 import { CreateLinkDto, LinkCoreDto, UpdateLinkDto } from './tj.dto';
 
 type EndpointKind = 'tj' | 'olt' | 'onu';
@@ -236,6 +238,8 @@ export class LinkService {
     const path = normalisePath(dto.path);
     const lengthM = routeLengthMeters(from.lat, from.lng, to.lat, to.lng, path);
     const subAreaId = await assertSubArea(this.db, dto.subAreaId);
+    // A subscriber needs a free ONU slot on the PON port this span lands on.
+    await this.assertPonCapacity(from, to, cores);
 
     const rows = await this.db.query<{ id: string }>(
       `INSERT INTO tj_links (from_tj_id, from_olt_id, from_onu_id,
@@ -302,6 +306,8 @@ export class LinkService {
     const lengthM = routeLengthMeters(from.lat, from.lng, to.lat, to.lng, path);
     const subAreaId =
       dto.subAreaId !== undefined ? await assertSubArea(this.db, dto.subAreaId) : row.sub_area_id;
+    // Re-patching an ONU must still leave its PON port within its ONU limit.
+    await this.assertPonCapacity(from, to, cores, id);
 
     await this.db.query(
       `UPDATE tj_links SET
@@ -452,6 +458,36 @@ export class LinkService {
     }
   }
 
+  /**
+   * A span that terminates on an ONU provisions that subscriber on the PON port
+   * at the head of its chain. The port only has the ONU slots its OLT type
+   * allows, so a full port refuses the connection.
+   */
+  private async assertPonCapacity(
+    from: Endpoint,
+    to: Endpoint,
+    cores: LinkCore[],
+    linkId?: string,
+  ) {
+    const onuId = from.kind === 'onu' ? from.id : to.kind === 'onu' ? to.id : null;
+    if (!onuId) return;
+    await assertPonOnuCapacity(this.db, [onuId], {
+      id: linkId ?? `pending-${onuId}`,
+      fromTjId: from.kind === 'tj' ? from.id : null,
+      fromOltId: from.kind === 'olt' ? from.id : null,
+      fromOnuId: from.kind === 'onu' ? from.id : null,
+      toTjId: to.kind === 'tj' ? to.id : null,
+      toOltId: to.kind === 'olt' ? to.id : null,
+      toOnuId: to.kind === 'onu' ? to.id : null,
+      fromCoreLabel: cores.find((core) => core.fromCoreLabel)?.fromCoreLabel ?? null,
+      toCoreLabel: cores.find((core) => core.toCoreLabel)?.toCoreLabel ?? null,
+      cores: cores.map((core) => ({
+        fromCoreLabel: core.fromCoreLabel,
+        toCoreLabel: core.toCoreLabel,
+      })),
+    });
+  }
+
   /** Marks the mapped joint cores in use on this link, and frees the ones it no longer carries. */
   private async syncDeviceCores(linkId: string, endpoint: Endpoint | null, labels: (string | null)[]) {
     if (!endpoint || endpoint.kind !== 'tj') return;
@@ -527,36 +563,30 @@ export class LinkService {
     );
   }
 
-  /** Frees or marks this ONU's cores when a link is mapped to them. */
+  /**
+   * Frees or marks this ONU's single PON input port. Any ONU-side core mapped on
+   * this link is that one port, so labels only decide whether it is connected.
+   */
   private async syncOnuCores(linkId: string, endpoint: Endpoint | null, labels: (string | null)[]) {
     if (!endpoint || endpoint.kind !== 'onu') return;
-    const wanted = new Set(labels.filter((label): label is string => Boolean(label)));
+    const mapped = labels.some(Boolean);
     const rows = await this.db.query<{ cores: unknown }>('SELECT cores FROM onus WHERE id = $1', [
       endpoint.id,
     ]);
     if (rows.length === 0) return;
-    const list = Array.isArray(rows[0].cores) ? rows[0].cores : [];
-    let changed = false;
-    const next = list.map((item) => {
-      const core = (item ?? {}) as Record<string, unknown> & {
-        label?: string;
-        status?: string;
-        connectedLinkId?: string;
-      };
-      const isMapped = Boolean(core.label) && wanted.has(String(core.label));
-      const ownedHere = core.connectedLinkId === linkId;
-      if (isMapped && (core.status !== 'in_use' || ownedHere !== true)) {
-        changed = true;
-        return { ...core, status: 'in_use', connectedLinkId: linkId };
-      }
-      if (!isMapped && ownedHere) {
-        changed = true;
-        const { connectedLinkId: _drop, ...rest } = core;
-        return { ...rest, status: 'free' };
-      }
-      return core;
+    const list = Array.isArray(rows[0].cores) ? (rows[0].cores as Record<string, unknown>[]) : [];
+    const owner = list.find((core) => typeof core.connectedLinkId === 'string');
+    const port = (status: string, connectedLinkId?: string) => ({
+      ...(connectedLinkId ? { connectedLinkId } : {}),
+      label: ONU_PORT_LABEL,
+      status,
     });
-    if (!changed) return;
+    const next = mapped
+      ? [port('in_use', linkId)]
+      : owner && owner.connectedLinkId !== linkId
+        ? [port(String(owner.status ?? 'in_use'), String(owner.connectedLinkId))]
+        : [port('free')];
+    if (JSON.stringify(next) === JSON.stringify(list)) return;
     await this.db.query('UPDATE onus SET cores = $2::jsonb, updated_at = now() WHERE id = $1', [
       endpoint.id,
       JSON.stringify(next),
@@ -651,29 +681,12 @@ export class LinkService {
     if (endpoint.kind === 'onu') {
       const rows = await this.db.query<{ cores: unknown }>('SELECT cores FROM onus WHERE id = $1', [endpoint.id]);
       if (rows.length === 0) return;
-      const list = Array.isArray(rows[0].cores) ? rows[0].cores : [];
-      let changed = false;
-      const next = list.map((item) => {
-        const core = (item ?? {}) as Record<string, unknown> & {
-          label?: string;
-          status?: string;
-          connectedLinkId?: string;
-        };
-        if (
-          core.connectedLinkId === linkId &&
-          Boolean(core.label) &&
-          wanted.has(String(core.label)) &&
-          core.status !== coreStatus
-        ) {
-          changed = true;
-          return { ...core, status: coreStatus };
-        }
-        return core;
-      });
-      if (!changed) return;
+      const list = Array.isArray(rows[0].cores) ? (rows[0].cores as Record<string, unknown>[]) : [];
+      const owned = list.find((core) => core.connectedLinkId === linkId);
+      if (!owned || owned.status === coreStatus) return;
       await this.db.query('UPDATE onus SET cores = $2::jsonb, updated_at = now() WHERE id = $1', [
         endpoint.id,
-        JSON.stringify(next),
+        JSON.stringify([{ label: ONU_PORT_LABEL, status: coreStatus, connectedLinkId: linkId }]),
       ]);
     }
   }

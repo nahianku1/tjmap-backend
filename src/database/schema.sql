@@ -140,6 +140,8 @@ CREATE INDEX IF NOT EXISTS tjs_olt_idx ON tjs (olt_id);
 
 ALTER TABLE olts ADD COLUMN IF NOT EXISTS pon_ports jsonb NOT NULL DEFAULT '[]'::jsonb;
 ALTER TABLE olts ADD COLUMN IF NOT EXISTS ethernet_ports jsonb NOT NULL DEFAULT '[]'::jsonb;
+-- PON technology this cabinet runs: GPON or EPON.
+ALTER TABLE olts ADD COLUMN IF NOT EXISTS olt_type text NOT NULL DEFAULT 'gpon';
 -- Feed cable patched into the cabinet; filled from the connected span when one exists.
 ALTER TABLE olts ADD COLUMN IF NOT EXISTS fibre_id text;
 

@@ -25,6 +25,11 @@ export class LinkController {
     return this.links.list();
   }
 
+  @Get(':id')
+  get(@Param('id', ParseUUIDPipe) id: string) {
+    return this.links.get(id);
+  }
+
   @Post()
   @Roles('admin')
   create(@Body() dto: CreateLinkDto, @Req() req: AuthenticatedRequest) {

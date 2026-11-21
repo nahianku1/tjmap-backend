@@ -44,6 +44,7 @@ export class DatabaseService implements OnModuleInit, OnModuleDestroy {
       CREATE INDEX IF NOT EXISTS tjs_sub_area_idx ON tjs (sub_area_id);
       ALTER TABLE olts ADD COLUMN IF NOT EXISTS sub_area_id uuid REFERENCES sub_areas(id) ON DELETE SET NULL;
       CREATE INDEX IF NOT EXISTS olts_sub_area_idx ON olts (sub_area_id);
+      ALTER TABLE olts ADD COLUMN IF NOT EXISTS olt_type text NOT NULL DEFAULT 'gpon';
 
       CREATE TABLE IF NOT EXISTS onus (
         id          uuid PRIMARY KEY DEFAULT gen_random_uuid(),

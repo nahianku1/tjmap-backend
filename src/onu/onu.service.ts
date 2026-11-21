@@ -6,15 +6,16 @@ import {
   CreateOnuDto,
   ONU_CLASSES,
   ONU_CORE_STATUSES,
+  ONU_PORT_LABEL,
   PON_TYPES,
   UpdateOnuDto,
 } from './onu.dto';
 
 export interface OnuCore {
+  /** Internal key only: an ONU port has no user-given name and no colour. */
   label: string;
-  color: string;
   status: (typeof ONU_CORE_STATUSES)[number];
-  /** Which link is using this core, so removing that link can free it again. */
+  /** Which link is using this port, so removing that link can free it again. */
   connectedLinkId?: string | null;
 }
 
@@ -53,17 +54,6 @@ const ONU_SELECT = `
   LEFT JOIN districts d ON d.id = a.district_id
   LEFT JOIN sub_areas sa ON sa.id = o.sub_area_id`;
 
-const FALLBACK_COLORS = [
-  '#22d3ee',
-  '#34d399',
-  '#a78bfa',
-  '#fbbf24',
-  '#fb7185',
-  '#60a5fa',
-  '#a3e635',
-  '#fb923c',
-];
-
 function asArray(value: unknown): unknown[] {
   if (Array.isArray(value)) return value;
   if (typeof value === 'string') {
@@ -77,29 +67,35 @@ function asArray(value: unknown): unknown[] {
   return [];
 }
 
+/**
+ * An ONU terminates one drop cable on a single PON input port, like a real ONU.
+ * The port has no colour and no user-given name, so it is stored as one entry
+ * under a fixed internal label. Rows saved by older builds may carry several
+ * coloured cores; they collapse onto that one port, keeping whichever entry the
+ * current link owns so deleting the link still frees it.
+ */
+export { ONU_PORT_LABEL };
+
+export function onuPort(status: OnuCore['status'] = 'free'): OnuCore {
+  return { label: ONU_PORT_LABEL, status };
+}
+
 function normaliseCores(value: unknown): OnuCore[] {
-  return asArray(value)
-    .map((item, index): OnuCore | null => {
-      if (!item || typeof item !== 'object') return null;
-      const entry = item as { label?: unknown; color?: unknown; status?: unknown };
-      const label = typeof entry.label === 'string' ? entry.label.trim() : '';
-      if (!label) return null;
-      const color =
-        typeof entry.color === 'string' && /^#[0-9a-fA-F]{6}$/.test(entry.color)
-          ? entry.color
-          : FALLBACK_COLORS[index % FALLBACK_COLORS.length];
-      const status =
+  const entries = asArray(value)
+    .filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === 'object')
+    .map((entry) => ({
+      status:
         typeof entry.status === 'string' &&
         ONU_CORE_STATUSES.includes(entry.status as OnuCore['status'])
           ? (entry.status as OnuCore['status'])
-          : 'free';
-      const linked =
-        typeof (entry as { connectedLinkId?: unknown }).connectedLinkId === 'string'
-          ? (entry as { connectedLinkId: string }).connectedLinkId
-          : null;
-      return linked ? { label, color, status, connectedLinkId: linked } : { label, color, status };
-    })
-    .filter((entry): entry is OnuCore => entry !== null);
+          : 'free',
+      connectedLinkId:
+        typeof entry.connectedLinkId === 'string' ? entry.connectedLinkId : null,
+    }));
+  const owned = entries.find((entry) => entry.connectedLinkId);
+  const port = onuPort(owned?.status ?? entries[0]?.status ?? 'free');
+  if (owned?.connectedLinkId) port.connectedLinkId = owned.connectedLinkId;
+  return [port];
 }
 
 @Injectable()
@@ -140,7 +136,7 @@ export class OnuService {
         dto.fibreId?.trim() || null,
         dto.ponType ?? 'gpon',
         dto.onuClass ?? 'B+',
-        JSON.stringify(normaliseCores(dto.cores)),
+        JSON.stringify([onuPort()]),
         dto.notes?.trim() || null,
         placement.areaId,
         dto.lat ?? null,
@@ -164,17 +160,10 @@ export class OnuService {
 
     const lat = dto.lat ?? existing.lat;
     const lng = dto.lng ?? existing.lng;
-    // Editing the ONU rebuilds its cores from the form; keep the link ownership
-    // marker per core label so removing that link still frees the core.
-    const cores =
-      dto.cores !== undefined
-        ? normaliseCores(dto.cores).map((core) => {
-            const previous = existing.cores.find((item) => item.label === core.label);
-            return previous?.connectedLinkId
-              ? { ...core, connectedLinkId: previous.connectedLinkId }
-              : core;
-          })
-        : existing.cores;
+    // The single PON input port belongs to whichever link is patched to it;
+    // saving the ONU never renames it or changes its state. Writing the
+    // normalised port back also folds legacy multi-core rows into one.
+    const cores = existing.cores;
 
     const rows = await this.db.query<{ id: string }>(
       `UPDATE onus SET

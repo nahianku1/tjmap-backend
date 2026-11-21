@@ -78,6 +78,11 @@ export class CreateOltDto {
   @MaxLength(40)
   code?: string;
 
+  @IsOptional()
+  @IsString()
+  @MaxLength(30)
+  oltType?: string;
+
   /** Primary PON port. Derived from the first `ponPorts` entry when that list is sent. */
   @IsOptional()
   @IsString()
@@ -144,6 +149,11 @@ export class UpdateOltDto {
   @IsString()
   @MaxLength(40)
   code?: string;
+
+  @IsOptional()
+  @IsString()
+  @MaxLength(30)
+  oltType?: string;
 
   @IsOptional()
   @ValidateIf((_object, value) => value !== null)

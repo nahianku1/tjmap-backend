@@ -11,7 +11,7 @@ import {
   UseGuards,
 } from '@nestjs/common';
 import { TjService } from './tj.service';
-import { CreateTjDto, UpdateTjDto } from './tj.dto';
+import { ChangeOutputCoreDto, CreateTjDto, UpdateTjDto } from './tj.dto';
 import { AuthenticatedRequest, JwtAuthGuard, RolesGuard } from '../auth/auth.guard';
 import { Roles } from '../auth/roles.decorator';
 
@@ -39,6 +39,13 @@ export class TjController {
   @Roles('admin')
   create(@Body() dto: CreateTjDto, @Req() req: AuthenticatedRequest) {
     return this.tjs.create(dto, req.user!.id);
+  }
+
+  /** Moves the cables on one output core onto another free one (faulty leg). */
+  @Patch(':id/output-core')
+  @Roles('admin')
+  changeOutputCore(@Param('id', ParseUUIDPipe) id: string, @Body() dto: ChangeOutputCoreDto) {
+    return this.tjs.changeOutputCore(id, dto);
   }
 
   @Patch(':id')

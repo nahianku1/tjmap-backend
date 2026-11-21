@@ -5,7 +5,7 @@ import { guardDuplicate } from '../database/pg-errors';
 import { resolvePlacement } from '../database/placement';
 import { OltService } from '../olt/olt.service';
 import { OnuService } from '../onu/onu.service';
-import { CreateTjDto, UpdateTjDto } from './tj.dto';
+import { ChangeOutputCoreDto, CreateTjDto, UpdateTjDto } from './tj.dto';
 
 interface TjRow {
   id: string;
@@ -307,6 +307,179 @@ export class TjService {
     );
 
     return this.get(rows[0].id);
+  }
+
+  /**
+   * Moves everything patched onto one output core — the cable links terminated
+   * on it and the user drop cables joined to it — onto another free output core.
+   * This is the field fix for a faulty splitter leg: the old core keeps its Cut
+   * mark so it is never handed out again, and the power path follows the move.
+   */
+  async changeOutputCore(id: string, dto: ChangeOutputCoreDto) {
+    const fromLabel = dto.fromLabel?.trim();
+    const toLabel = dto.toLabel?.trim();
+    if (!fromLabel || !toLabel) {
+      throw new BadRequestException('Pick the output core to change and the free core to move onto.');
+    }
+    if (fromLabel === toLabel) {
+      throw new BadRequestException('Pick a different output core.');
+    }
+
+    const rows = await this.db.query<{
+      user_fibres: unknown;
+      output_cores: unknown;
+      splitter: unknown;
+      splitters: unknown;
+    }>('SELECT user_fibres, output_cores, splitter, splitters FROM tjs WHERE id = $1', [id]);
+    if (rows.length === 0) throw new NotFoundException('Terminal joint not found');
+    const row = rows[0];
+
+    // A joint keeps its legs in the legacy `output_cores` column, the legacy
+    // single `splitter` and each splitter of `splitters`; all of them mirror.
+    const legacySplitter = (row.splitter ?? null) as Record<string, unknown> | null;
+    const splitters = Array.isArray(row.splitters)
+      ? (row.splitters as Record<string, unknown>[])
+      : [];
+    const outputLists: unknown[][] = [];
+    if (Array.isArray(row.output_cores)) outputLists.push(row.output_cores as unknown[]);
+    if (legacySplitter && Array.isArray(legacySplitter.outputs)) {
+      outputLists.push(legacySplitter.outputs as unknown[]);
+    }
+    splitters.forEach((splitter) => {
+      if (Array.isArray(splitter.outputs)) outputLists.push(splitter.outputs as unknown[]);
+    });
+
+    const findCore = (label: string): Record<string, unknown> | null => {
+      for (const list of outputLists) {
+        const found = list.find(
+          (item) => (item as Record<string, unknown> | null)?.label === label,
+        );
+        if (found) return found as Record<string, unknown>;
+      }
+      return null;
+    };
+
+    const source = findCore(fromLabel);
+    if (!source) throw new BadRequestException('That output core is not on this joint.');
+    const target = findCore(toLabel);
+    if (!target) throw new BadRequestException('Pick another output core of this joint.');
+
+    if (
+      String(target.status ?? 'free') !== 'free' ||
+      target.connectedLinkId ||
+      target.connectedUserFibreId
+    ) {
+      throw new BadRequestException('That output core is already in use. Pick a free one.');
+    }
+
+    const userFibres = Array.isArray(row.user_fibres)
+      ? (row.user_fibres as Record<string, unknown>[])
+      : [];
+    const movingFibres = userFibres.filter((fibre) => fibre.outputCoreLabel === fromLabel);
+
+    // A cable link terminates on this joint under the output core's label.
+    const links = await this.db.query<{
+      id: string;
+      from_tj_id: string | null;
+      to_tj_id: string | null;
+      cores: unknown;
+    }>(
+      'SELECT id, from_tj_id, to_tj_id, cores FROM tj_links WHERE from_tj_id = $1 OR to_tj_id = $1',
+      [id],
+    );
+    const movedLinks = links.flatMap((link) => {
+      const key = link.from_tj_id === id ? 'fromCoreLabel' : 'toCoreLabel';
+      const cores = Array.isArray(link.cores) ? (link.cores as Record<string, unknown>[]) : [];
+      let changed = false;
+      const next = cores.map((core) => {
+        if (!core || core[key] !== fromLabel) return core;
+        changed = true;
+        return { ...core, [key]: toLabel };
+      });
+      return changed ? [{ id: link.id, cores: next }] : [];
+    });
+
+    const sourceStatus = String(source.status ?? 'free');
+    if (sourceStatus === 'free' && movingFibres.length === 0 && movedLinks.length === 0) {
+      throw new BadRequestException('Nothing is patched onto that output core yet.');
+    }
+
+    // Ownership follows the cables, so the old core can be handed out again once
+    // it is repaired, and the new core is shown as In Use by the same link.
+    const owner = Object.fromEntries(
+      Object.entries({
+        connectedLinkId: movedLinks.length === 1 ? movedLinks[0].id : source.connectedLinkId,
+        connectedUserFibreId: source.connectedUserFibreId,
+        connectedUserCoreLabel: source.connectedUserCoreLabel,
+      }).filter(([, value]) => value !== undefined && value !== null),
+    );
+    const stripOwner = (core: Record<string, unknown>) => {
+      const { connectedLinkId, connectedUserFibreId, connectedUserCoreLabel, ...rest } = core;
+      return rest;
+    };
+
+    const rewrite = (list: unknown): unknown[] | null => {
+      if (!Array.isArray(list)) return null;
+      let changed = false;
+      const next = list.map((item) => {
+        const core = { ...((item ?? {}) as Record<string, unknown>) };
+        if (core.label === fromLabel) {
+          changed = true;
+          return {
+            ...stripOwner(core),
+            status: sourceStatus === 'damaged' ? 'damaged' : 'free',
+          };
+        }
+        if (core.label === toLabel) {
+          changed = true;
+          return { ...stripOwner(core), ...owner, status: 'in_use' };
+        }
+        return core;
+      });
+      return changed ? next : null;
+    };
+
+    const outputCores = rewrite(row.output_cores) ?? (row.output_cores ?? []);
+    const nextSplitter = legacySplitter
+      ? { ...legacySplitter, outputs: rewrite(legacySplitter.outputs) ?? legacySplitter.outputs ?? [] }
+      : row.splitter;
+    const nextSplitters = splitters.map((splitter) => {
+      const outputs = rewrite(splitter.outputs);
+      return outputs ? { ...splitter, outputs } : splitter;
+    });
+
+    for (const link of movedLinks) {
+      const primaryFrom =
+        link.cores.find((core) => core?.fromCoreLabel)?.fromCoreLabel ?? null;
+      const primaryTo = link.cores.find((core) => core?.toCoreLabel)?.toCoreLabel ?? null;
+      await this.db.query(
+        `UPDATE tj_links SET cores = $2::jsonb, from_core_label = $3, to_core_label = $4,
+                             updated_at = now()
+         WHERE id = $1`,
+        [link.id, JSON.stringify(link.cores), primaryFrom, primaryTo],
+      );
+    }
+
+    await this.db.query(
+      `UPDATE tjs SET output_cores = $2::jsonb, splitter = $3::jsonb, splitters = $4::jsonb,
+                      user_fibres = $5::jsonb, updated_at = now()
+       WHERE id = $1`,
+      [
+        id,
+        JSON.stringify(outputCores),
+        JSON.stringify(nextSplitter ?? { enabled: false, ratio: null, outputs: [] }),
+        JSON.stringify(nextSplitters),
+        JSON.stringify(
+          userFibres.map((fibre) =>
+            fibre.outputCoreLabel === fromLabel
+              ? { ...fibre, outputCoreLabel: toLabel }
+              : fibre,
+          ),
+        ),
+      ],
+    );
+
+    return this.get(id);
   }
 
   private async assertOlt(oltId?: string | null) {

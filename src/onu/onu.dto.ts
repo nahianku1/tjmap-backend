@@ -1,7 +1,5 @@
 import { Type } from 'class-transformer';
 import {
-  ArrayMaxSize,
-  IsArray,
   IsIn,
   IsInt,
   IsLatitude,
@@ -9,40 +7,20 @@ import {
   IsOptional,
   IsString,
   IsUUID,
-  Matches,
   MaxLength,
   MinLength,
   ValidateIf,
-  ValidateNested,
 } from 'class-validator';
 
 export const ONU_CORE_STATUSES = ['in_use', 'free', 'spliced', 'damaged'] as const;
+
+/** Internal key of the ONU's one PON input port; never shown as a core name. */
+export const ONU_PORT_LABEL = 'PON';
 
 export const PON_TYPES = ['epon', 'gpon'] as const;
 
 /** ODN loss windows the ONU optic is specified for. */
 export const ONU_CLASSES = ['A', 'B', 'B+', 'C', 'C+', 'C++', 'PX10', 'PX20', 'PX30'] as const;
-
-export class OnuCoreDto {
-  @IsString()
-  @MinLength(1)
-  @MaxLength(40)
-  label: string;
-
-  @IsOptional()
-  @Matches(/^#[0-9a-fA-F]{6}$/)
-  color?: string;
-
-  @IsOptional()
-  @IsIn(ONU_CORE_STATUSES)
-  status?: (typeof ONU_CORE_STATUSES)[number];
-
-  /** Link that currently patches this core; set by the link service, must survive ONU saves. */
-  @IsOptional()
-  @IsString()
-  @MaxLength(80)
-  connectedLinkId?: string | null;
-}
 
 export class CreateOnuDto {
   @IsString()
@@ -74,13 +52,6 @@ export class CreateOnuDto {
   @IsOptional()
   @IsIn(ONU_CLASSES)
   onuClass?: (typeof ONU_CLASSES)[number];
-
-  @IsOptional()
-  @IsArray()
-  @ArrayMaxSize(64)
-  @ValidateNested({ each: true })
-  @Type(() => OnuCoreDto)
-  cores?: OnuCoreDto[];
 
   @IsOptional()
   @IsUUID()
@@ -137,13 +108,6 @@ export class UpdateOnuDto {
   @IsOptional()
   @IsIn(ONU_CLASSES)
   onuClass?: (typeof ONU_CLASSES)[number];
-
-  @IsOptional()
-  @IsArray()
-  @ArrayMaxSize(64)
-  @ValidateNested({ each: true })
-  @Type(() => OnuCoreDto)
-  cores?: OnuCoreDto[];
 
   @IsOptional()
   @IsUUID()

@@ -449,6 +449,18 @@ export class UpdateTjDto {
   userFibres?: UserFibreDto[];
 }
 
+export class ChangeOutputCoreDto {
+  /** Output core currently carrying the cables (the one that went faulty). */
+  @IsString()
+  @MaxLength(40)
+  fromLabel: string;
+
+  /** Free output core the cables are moved onto. */
+  @IsString()
+  @MaxLength(40)
+  toLabel: string;
+}
+
 export class LinkCoreDto {
   @IsOptional()
   @Type(() => Number)
