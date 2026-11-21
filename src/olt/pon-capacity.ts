@@ -48,8 +48,8 @@ interface PonOltShape {
   code: string;
   name: string;
   oltType: string;
-  /** Every PON port label fitted on the cabinet. */
-  ports: string[];
+  /** Every PON port fitted on the cabinet, with the VLAN it carries if any. */
+  ports: { label: string; vlanId: number | null }[];
   /** Port used by spans that do not name one. */
   primaryPort: string | null;
 }
@@ -66,6 +66,8 @@ export interface PonPortLoad {
   oltName: string;
   oltType: string;
   portLabel: string;
+  /** Service VLAN carried by this port, when one is configured. */
+  vlanId: number | null;
   capacity: number;
   /** ONUs provisioned downstream of this port. */
   onuIds: string[];
@@ -150,11 +152,22 @@ function localCores(link: PonLinkShape, side: Side): string[] {
   return scalar ? [scalar.toLowerCase()] : [];
 }
 
+function portVlan(value: unknown): number | null {
+  const vlan = Number(value);
+  return Number.isInteger(vlan) && vlan >= 1 && vlan <= 4094 ? vlan : null;
+}
+
 function normaliseOlt(row: OltDbRow): PonOltShape {
   const ports = asArray(row.pon_ports)
-    .map((item) => (item && typeof item === 'object' ? normaliseLabel((item as { label?: unknown }).label) : ''))
-    .filter(Boolean);
-  const primary = normaliseLabel(row.pon_port) || ports[0] || null;
+    .map((item) => {
+      if (!item || typeof item !== 'object') return null;
+      const entry = item as { label?: unknown; vlanId?: unknown };
+      const label = normaliseLabel(entry.label);
+      if (!label) return null;
+      return { label, vlanId: portVlan(entry.vlanId) };
+    })
+    .filter((port): port is { label: string; vlanId: number | null } => port !== null);
+  const primary = normaliseLabel(row.pon_port) || ports[0]?.label || null;
   return {
     id: row.id,
     code: row.code,
@@ -294,14 +307,15 @@ export function computePonPortLoads(
   const loads: PonPortLoad[] = [];
   for (const olt of olts) {
     const capacity = ponOnuCapacity(olt.oltType);
-    for (const portLabel of olt.ports) {
-      const { onuIds, tjIds } = reachableFromPort(olt, portLabel, links, tjMap);
+    for (const port of olt.ports) {
+      const { onuIds, tjIds } = reachableFromPort(olt, port.label, links, tjMap);
       loads.push({
         oltId: olt.id,
         oltCode: olt.code,
         oltName: olt.name,
         oltType: olt.oltType,
-        portLabel,
+        portLabel: port.label,
+        vlanId: port.vlanId,
         capacity,
         onuIds: [...onuIds],
         tjIds: [...tjIds],
@@ -353,30 +367,107 @@ export async function ponOnuUsage(
   return usage;
 }
 
-/**
- * Refuses a link that would take a PON port past the ONU limit its OLT type
- * supports. `candidate` is the span about to be saved; it replaces the stored
- * row with the same id (or joins the tree when its id is new).
- */
-export async function assertPonOnuCapacity(
-  db: DatabaseService,
-  onuIds: string[],
-  candidate?: PonLinkShape,
-): Promise<void> {
-  if (onuIds.length === 0) return;
-  const topology = await loadTopology(db);
-  const links = candidate
-    ? [...topology.links.filter((link) => link.id !== candidate.id), candidate]
-    : topology.links;
-  const loads = computePonPortLoads(topology.olts, topology.tjs, links);
+export type PonFamily = 'epon' | 'gpon' | 'both';
 
-  for (const onuId of onuIds) {
-    const load = loads.find((item) => item.onuIds.includes(onuId));
-    if (!load || load.onuIds.length <= load.capacity) continue;
-    throw new BadRequestException(
-      `${load.oltCode} PON ${load.portLabel} is full — ${load.onuIds.length}/${load.capacity} ONUs ` +
-        `(${load.oltType.replace('_', '-').toUpperCase()} limit). Free a subscriber on this port, ` +
-        'or patch this ONU onto another PON port.',
-    );
+/**
+ * The PON standard an OLT speaks: EPON is IEEE, GPON and XG(S)-PON are ITU.
+ * A combo cabinet carries both kinds of line card.
+ */
+export function ponOltFamily(oltType: string | null | undefined): PonFamily {
+  const type = (oltType ?? '').trim().toLowerCase();
+  if (type === 'epon') return 'epon';
+  if (type === 'combo') return 'both';
+  return 'gpon';
+}
+
+/** The PON standard an ONU is built for. */
+export function ponOnuFamily(ponType: string | null | undefined): 'epon' | 'gpon' {
+  return (ponType ?? '').trim().toLowerCase() === 'epon' ? 'epon' : 'gpon';
+}
+
+function article(word: string): string {
+  return /^[aeioux]/i.test(word) ? 'an' : 'a';
+}
+
+function portKey(load: PonPortLoad): string {
+  return `${load.oltId}|${load.portLabel.trim().toLowerCase()}`;
+}
+
+/** The PON port that currently serves an ONU, if it is patched into a tree. */
+export async function onuServingPort(
+  db: DatabaseService,
+  onuId: string,
+): Promise<PonPortLoad | null> {
+  const topology = await loadTopology(db);
+  const loads = computePonPortLoads(topology.olts, topology.tjs, topology.links);
+  return loads.find((load) => load.onuIds.includes(onuId)) ?? null;
+}
+
+/** PON port loads for a single cabinet, VLAN ids included. */
+export async function ponLoadsForOlt(
+  db: DatabaseService,
+  oltId: string,
+): Promise<PonPortLoad[]> {
+  const topology = await loadTopology(db);
+  const olt = topology.olts.find((item) => item.id === oltId);
+  if (!olt) return [];
+  return computePonPortLoads([olt], topology.tjs, topology.links);
+}
+
+/**
+ * Refuses a link that would put a subscriber on the wrong kind of PON line
+ * card, or take its port past the ONU limit that OLT type supports. `candidate`
+ * is the span about to be saved; it replaces the stored row with the same id
+ * (or joins the tree when its id is new). Only ONUs that the link newly puts on
+ * a port are checked, so pre-existing mismatches elsewhere never block edits.
+ */
+export async function assertPonAssignment(
+  db: DatabaseService,
+  candidate: PonLinkShape,
+): Promise<void> {
+  const topology = await loadTopology(db);
+  const stored = topology.links.filter((link) => link.id !== candidate.id);
+  const before = computePonPortLoads(topology.olts, topology.tjs, stored);
+  const after = computePonPortLoads(topology.olts, topology.tjs, [...stored, candidate]);
+
+  const servedBefore = new Map(before.map((load) => [portKey(load), new Set(load.onuIds)]));
+  const touched = after
+    .map((load) => {
+      const previous = servedBefore.get(portKey(load)) ?? new Set<string>();
+      return { load, added: load.onuIds.filter((id) => !previous.has(id)) };
+    })
+    .filter((entry) => entry.added.length > 0);
+  if (touched.length === 0) return;
+
+  const onuIds = [...new Set(touched.flatMap((entry) => entry.added))];
+  const rows = await db.query<{ id: string; username: string; pon_type: string | null }>(
+    'SELECT id, username, pon_type FROM onus WHERE id = ANY($1::uuid[])',
+    [onuIds],
+  );
+  const onus = new Map(rows.map((row) => [row.id, row]));
+
+  for (const { load, added } of touched) {
+    const oltFamily = ponOltFamily(load.oltType);
+    const oltLabel = load.oltType.replace('_', '-').toUpperCase();
+    for (const onuId of added) {
+      const onu = onus.get(onuId);
+      if (!onu) continue;
+      const onuFamily = ponOnuFamily(onu.pon_type);
+      if (oltFamily === 'both' || oltFamily === onuFamily) continue;
+      const onuLabel = onuFamily.toUpperCase();
+      throw new BadRequestException(
+        `${load.oltCode} PON ${load.portLabel} is ${article(oltLabel)} ${oltLabel} port and only serves ` +
+          `${oltLabel} ONUs — ${onu.username} is ${article(onuLabel)} ${onuLabel} ONU. Patch it onto ` +
+          `${article(onuLabel)} ${onuLabel} OLT port, or change the ONU's PON technology.`,
+      );
+    }
+
+    if (load.onuIds.length > load.capacity) {
+      throw new BadRequestException(
+        `${load.oltCode} PON ${load.portLabel} is full — ${load.onuIds.length}/${load.capacity} ONUs ` +
+          `(${oltLabel} limit). Free a subscriber on this port, ` +
+          'or patch this ONU onto another PON port.',
+      );
+    }
   }
 }

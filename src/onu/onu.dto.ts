@@ -28,9 +28,10 @@ export class CreateOnuDto {
   @MaxLength(80)
   username: string;
 
+  /** Required: one physical ONU, one hardware address. Checked and normalised in the service. */
   @IsOptional()
-  @IsString()
-  @MaxLength(40)
+  @IsString({ message: 'MAC address is required.' })
+  @MaxLength(40, { message: 'MAC address must be at most 40 characters.' })
   macAddress?: string;
 
   /** 1–4094, or null for an untagged subscriber. Range-checked in the service. */

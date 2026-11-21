@@ -2,6 +2,7 @@ import { BadRequestException, Injectable, NotFoundException } from '@nestjs/comm
 import { DatabaseService } from '../database/database.service';
 import { linksTouching, releaseDeletedLinkCores } from '../database/link-core-release';
 import { guardDuplicate } from '../database/pg-errors';
+import { assertDeviceCodeAvailable } from '../database/device-codes';
 import { resolvePlacement } from '../database/placement';
 import { OltService } from '../olt/olt.service';
 import { OnuService } from '../onu/onu.service';
@@ -188,6 +189,8 @@ export class TjService {
     await this.assertOlt(dto.oltId);
     const tjType = dto.tjType ?? (dto.isCut ? 'cut' : 'box');
     const isCut = tjType === 'cut' || dto.isCut === true;
+    const code = dto.code.trim().toUpperCase();
+    await assertDeviceCodeAvailable(this.db, code);
 
     const rows = await guardDuplicate(
       this.db.query<{ id: string }>(
@@ -200,7 +203,7 @@ export class TjService {
                $22::jsonb, $23)
        RETURNING id`,
       [
-        dto.code.trim().toUpperCase(),
+        code,
         dto.name?.trim() || null,
         tjType,
         dto.lng,
@@ -241,6 +244,8 @@ export class TjService {
 
     const tjType = dto.tjType ?? existing.tjType ?? (dto.isCut ? 'cut' : 'box');
     const isCut = tjType === 'cut' || (dto.isCut !== undefined ? dto.isCut : existing.isCut);
+    const code = (dto.code ?? existing.code).toUpperCase();
+    await assertDeviceCodeAvailable(this.db, code, id);
 
     const rows = await guardDuplicate(
       this.db.query<{ id: string }>(
@@ -271,7 +276,7 @@ export class TjService {
        RETURNING id`,
       [
         id,
-        (dto.code ?? existing.code).toUpperCase(),
+        code,
         dto.name !== undefined ? dto.name?.trim() || null : existing.name,
         tjType,
         dto.lng ?? existing.lng,
@@ -586,7 +591,7 @@ export class TjService {
       lengthM: row.length_m === null ? null : Number(row.length_m),
       attenuationDbPerKm:
         row.attenuation_db_per_km === null || row.attenuation_db_per_km === undefined
-          ? 0.35
+          ? 0.5
           : Number(row.attenuation_db_per_km),
       spliceCount:
         row.splice_count === null || row.splice_count === undefined
@@ -594,7 +599,7 @@ export class TjService {
           : Number(row.splice_count),
       connectionLossDb:
         row.connection_loss_db === null || row.connection_loss_db === undefined
-          ? 1.0
+          ? 0.2
           : Number(row.connection_loss_db),
       color: row.color ?? null,
       notes: row.notes,

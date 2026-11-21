@@ -199,6 +199,77 @@ CREATE TABLE IF NOT EXISTS onus (
 );
 
 CREATE INDEX IF NOT EXISTS onus_area_idx ON onus (area_id);
+-- A hardware MAC address belongs to a single ONU across the whole network.
+CREATE OR REPLACE FUNCTION onus_mac_unique_guard() RETURNS trigger AS $fn$
+BEGIN
+  IF NEW.mac_address IS NOT NULL AND EXISTS (
+    SELECT 1 FROM onus o
+     WHERE lower(o.mac_address) = lower(NEW.mac_address)
+       AND o.id <> NEW.id
+  ) THEN
+    RAISE EXCEPTION 'MAC address % is already registered to another ONU', NEW.mac_address
+      USING ERRCODE = '23505', CONSTRAINT = 'onus_mac_unique';
+  END IF;
+  RETURN NEW;
+END;
+$fn$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS onus_mac_unique_guard ON onus;
+CREATE TRIGGER onus_mac_unique_guard
+  BEFORE INSERT OR UPDATE OF mac_address ON onus
+  FOR EACH ROW EXECUTE FUNCTION onus_mac_unique_guard();
+
+-- Device codes share one network-wide namespace across TJs, OLTs and ONUs:
+-- a TJ code, an OLT code and an ONU username may never match. The service
+-- layer checks this first for a friendly error; the trigger is the backstop.
+CREATE OR REPLACE FUNCTION device_code_unique_guard() RETURNS trigger AS $fn$
+DECLARE
+  v_code text := lower(COALESCE(to_jsonb(NEW)->>'code', to_jsonb(NEW)->>'username'));
+  v_hit text;
+BEGIN
+  IF v_code IS NULL OR v_code = '' THEN RETURN NEW; END IF;
+
+  IF TG_TABLE_NAME = 'tjs' THEN
+    SELECT 'OLT ' || o.code INTO v_hit FROM olts o WHERE lower(o.code) = v_code LIMIT 1;
+    IF v_hit IS NULL THEN
+      SELECT 'ONU ' || u.username INTO v_hit FROM onus u WHERE lower(u.username) = v_code LIMIT 1;
+    END IF;
+  ELSIF TG_TABLE_NAME = 'olts' THEN
+    SELECT 'TJ ' || t.code INTO v_hit FROM tjs t WHERE lower(t.code) = v_code LIMIT 1;
+    IF v_hit IS NULL THEN
+      SELECT 'ONU ' || u.username INTO v_hit FROM onus u WHERE lower(u.username) = v_code LIMIT 1;
+    END IF;
+  ELSE
+    SELECT 'TJ ' || t.code INTO v_hit FROM tjs t WHERE lower(t.code) = v_code LIMIT 1;
+    IF v_hit IS NULL THEN
+      SELECT 'OLT ' || o.code INTO v_hit FROM olts o WHERE lower(o.code) = v_code LIMIT 1;
+    END IF;
+    IF v_hit IS NULL THEN
+      SELECT 'ONU ' || u.username INTO v_hit FROM onus u
+       WHERE lower(u.username) = v_code AND u.id <> NEW.id LIMIT 1;
+    END IF;
+  END IF;
+
+  IF v_hit IS NOT NULL THEN
+    RAISE EXCEPTION 'Device code "%" is already used by %', v_code, v_hit
+      USING ERRCODE = '23505', CONSTRAINT = 'device_code_unique';
+  END IF;
+  RETURN NEW;
+END;
+$fn$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS tjs_code_global_guard ON tjs;
+CREATE TRIGGER tjs_code_global_guard
+  BEFORE INSERT OR UPDATE OF code ON tjs
+  FOR EACH ROW EXECUTE FUNCTION device_code_unique_guard();
+DROP TRIGGER IF EXISTS olts_code_global_guard ON olts;
+CREATE TRIGGER olts_code_global_guard
+  BEFORE INSERT OR UPDATE OF code ON olts
+  FOR EACH ROW EXECUTE FUNCTION device_code_unique_guard();
+DROP TRIGGER IF EXISTS onus_username_global_guard ON onus;
+CREATE TRIGGER onus_username_global_guard
+  BEFORE INSERT OR UPDATE OF username ON onus
+  FOR EACH ROW EXECUTE FUNCTION device_code_unique_guard();
 CREATE INDEX IF NOT EXISTS onus_location_gix ON onus USING GIST (location);
 -- The ONU drop fibre is optional and copied from the connected link when drawn.
 ALTER TABLE onus ALTER COLUMN fibre_id DROP NOT NULL;
@@ -210,3 +281,13 @@ ALTER TABLE tj_links ADD COLUMN IF NOT EXISTS from_onu_id uuid REFERENCES onus(i
 ALTER TABLE tj_links ADD COLUMN IF NOT EXISTS to_onu_id uuid REFERENCES onus(id) ON DELETE CASCADE;
 CREATE INDEX IF NOT EXISTS tj_links_from_onu_idx ON tj_links (from_onu_id);
 CREATE INDEX IF NOT EXISTS tj_links_to_onu_idx ON tj_links (to_onu_id);
+
+-- Every fibre span carries its own ID across the whole network; the service
+-- layer reports conflicts first, the index enforces it for every write.
+DO $$
+BEGIN
+  CREATE UNIQUE INDEX IF NOT EXISTS tj_links_fibre_id_unique
+    ON tj_links (lower(fibre_id)) WHERE fibre_id IS NOT NULL AND fibre_id <> '';
+EXCEPTION WHEN unique_violation THEN
+  RAISE NOTICE 'tj_links_fibre_id_unique not created: existing duplicate fibre IDs';
+END $$;

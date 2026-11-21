@@ -1,7 +1,11 @@
 import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
 import { DatabaseService } from '../database/database.service';
 import { linksTouching, releaseDeletedLinkCores } from '../database/link-core-release';
+import { assertDeviceCodeAvailable } from '../database/device-codes';
 import { resolvePlacement } from '../database/placement';
+import { onuServingPort, ponOltFamily, ponOnuFamily } from '../olt/pon-capacity';
+import { assertMacAvailable, normalizeMacAddress } from './mac-address';
+import { assertVlanAvailable, syncOnuPonVlan } from './vlan-pool';
 import {
   CreateOnuDto,
   ONU_CLASSES,
@@ -120,6 +124,10 @@ export class OnuService {
     const placement = await resolvePlacement(this.db, dto.areaId, dto.subAreaId);
     this.assertLocation(dto.lat, dto.lng);
     this.assertVlan(dto.vlanId);
+    if (dto.vlanId != null) await assertVlanAvailable(this.db, dto.vlanId);
+    await assertDeviceCodeAvailable(this.db, dto.username);
+    const macAddress = normalizeMacAddress(dto.macAddress);
+    await assertMacAvailable(this.db, macAddress);
 
     const rows = await this.db.query<{ id: string }>(
       `       INSERT INTO onus (username, mac_address, vlan_id, fibre_id, pon_type, onu_class,
@@ -131,7 +139,7 @@ export class OnuService {
        RETURNING id`,
       [
         dto.username.trim(),
-        dto.macAddress?.trim() || null,
+        macAddress,
         dto.vlanId ?? null,
         dto.fibreId?.trim() || null,
         dto.ponType ?? 'gpon',
@@ -145,6 +153,9 @@ export class OnuService {
         placement.subAreaId,
       ],
     );
+    // A registered subscriber is provisioned with a service VLAN straight away;
+    // once a drop cable lands it takes the VLAN of its serving PON port instead.
+    await syncOnuPonVlan(this.db, rows[0].id);
     return this.get(rows[0].id);
   }
 
@@ -157,6 +168,18 @@ export class OnuService {
     );
     this.assertLocation(dto.lat ?? existing.lat ?? undefined, dto.lng ?? existing.lng ?? undefined);
     if (dto.vlanId !== undefined) this.assertVlan(dto.vlanId);
+    if (dto.vlanId != null) await assertVlanAvailable(this.db, dto.vlanId, id);
+    await this.assertPonTypeMatch(id, dto.ponType, existing.ponType);
+    const username = dto.username?.trim() || existing.username;
+    await assertDeviceCodeAvailable(this.db, username, id);
+    let macAddress = existing.macAddress ?? null;
+    if (dto.macAddress !== undefined) {
+      if (!dto.macAddress?.trim()) {
+        throw new BadRequestException('MAC address is required.');
+      }
+      macAddress = normalizeMacAddress(dto.macAddress);
+      await assertMacAvailable(this.db, macAddress, id);
+    }
 
     const lat = dto.lat ?? existing.lat;
     const lng = dto.lng ?? existing.lng;
@@ -184,8 +207,8 @@ export class OnuService {
        RETURNING id`,
       [
         id,
-        dto.username?.trim() || existing.username,
-        dto.macAddress !== undefined ? dto.macAddress?.trim() || null : existing.macAddress ?? null,
+        username,
+        macAddress,
         dto.vlanId !== undefined ? dto.vlanId ?? null : existing.vlanId ?? null,
         dto.fibreId?.trim() || existing.fibreId,
         dto.ponType ?? existing.ponType ?? 'gpon',
@@ -198,6 +221,7 @@ export class OnuService {
         placement.subAreaId,
       ],
     );
+    await syncOnuPonVlan(this.db, rows[0].id);
     return this.get(rows[0].id);
   }
 
@@ -207,6 +231,28 @@ export class OnuService {
     if (rows.length === 0) throw new NotFoundException('ONU not found');
     await releaseDeletedLinkCores(this.db, links, id);
     return { ok: true, id };
+  }
+
+  /**
+   * PON technology is a property of the line card: a connected ONU cannot be
+   * switched to a standard the OLT port it is provisioned on does not speak.
+   */
+  private async assertPonTypeMatch(
+    id: string,
+    next?: string | null,
+    current?: string | null,
+  ) {
+    if (!next || next === current) return;
+    const port = await onuServingPort(this.db, id);
+    if (!port) return;
+    const oltFamily = ponOltFamily(port.oltType);
+    if (oltFamily === 'both' || oltFamily === ponOnuFamily(next)) return;
+    const oltLabel = port.oltType.replace('_', '-').toUpperCase();
+    const article = /^[aeioux]/i.test(oltLabel) ? 'an' : 'a';
+    throw new BadRequestException(
+      `${port.oltCode} PON ${port.portLabel} is ${article} ${oltLabel} port and only serves ` +
+        `${oltLabel} ONUs — this ONU cannot be changed to ${next.toUpperCase()}.`,
+    );
   }
 
   private assertLocation(lat?: number, lng?: number) {

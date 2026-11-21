@@ -2,7 +2,9 @@ import { BadRequestException, Injectable, NotFoundException } from '@nestjs/comm
 import { DatabaseService } from '../database/database.service';
 import { assertSubArea } from '../database/placement';
 import { ONU_PORT_LABEL } from '../onu/onu.dto';
-import { assertPonOnuCapacity } from '../olt/pon-capacity';
+import { assertPonAssignment } from '../olt/pon-capacity';
+import { syncOnuPonVlan } from '../onu/vlan-pool';
+import { locationLabel } from '../database/device-codes';
 import { CreateLinkDto, LinkCoreDto, UpdateLinkDto } from './tj.dto';
 
 type EndpointKind = 'tj' | 'olt' | 'onu';
@@ -232,14 +234,16 @@ export class LinkService {
     const to = await this.resolveEndpoint(dto.toTjId, dto.toOltId, dto.toOnuId, 'to');
     this.assertDistinct(from, to);
 
-    const cores = normaliseCores(dto.cores, dto.coreCount ?? dto.cores?.length ?? 0, dto.fromCoreLabel, dto.toCoreLabel);
+    const cores = normaliseCores(dto.cores, dto.coreCount ?? dto.cores?.length ?? 4, dto.fromCoreLabel, dto.toCoreLabel);
     const primaryFrom = cores.find((core) => core.fromCoreLabel)?.fromCoreLabel ?? null;
     const primaryTo = cores.find((core) => core.toCoreLabel)?.toCoreLabel ?? null;
     const path = normalisePath(dto.path);
     const lengthM = routeLengthMeters(from.lat, from.lng, to.lat, to.lng, path);
     const subAreaId = await assertSubArea(this.db, dto.subAreaId);
-    // A subscriber needs a free ONU slot on the PON port this span lands on.
+    // A subscriber needs a matching PON technology and a free ONU slot on the
+    // port this span lands on.
     await this.assertPonCapacity(from, to, cores);
+    await this.assertFibreIdAvailable(dto.fibreId.trim());
 
     const rows = await this.db.query<{ id: string }>(
       `INSERT INTO tj_links (from_tj_id, from_olt_id, from_onu_id,
@@ -269,9 +273,9 @@ export class LinkService {
         userId,
         JSON.stringify(path),
         lengthM,
-        dto.attenuationDbPerKm ?? 0.35,
+        dto.attenuationDbPerKm ?? 0.5,
         dto.spliceCount ?? 2,
-        dto.connectionLossDb ?? 1.0,
+        dto.connectionLossDb ?? 0.2,
         dto.color ?? null,
         subAreaId,
       ],
@@ -282,6 +286,9 @@ export class LinkService {
     await this.syncOnuCores(rows[0].id, from, cores.map((core) => core.fromCoreLabel));
     await this.syncOnuCores(rows[0].id, to, cores.map((core) => core.toCoreLabel));
     await this.syncTjUserFibres(rows[0].id, from, to, cores);
+    // Patching a drop cable provisions the subscriber: the OLT hands it a VLAN.
+    await this.provisionOnuVlan(from);
+    await this.provisionOnuVlan(to);
     return this.get(rows[0].id);
   }
 
@@ -308,6 +315,8 @@ export class LinkService {
       dto.subAreaId !== undefined ? await assertSubArea(this.db, dto.subAreaId) : row.sub_area_id;
     // Re-patching an ONU must still leave its PON port within its ONU limit.
     await this.assertPonCapacity(from, to, cores, id);
+    const fibreId = dto.fibreId?.trim() ?? row.fibre_id;
+    await this.assertFibreIdAvailable(fibreId, id);
 
     await this.db.query(
       `UPDATE tj_links SET
@@ -330,7 +339,7 @@ export class LinkService {
        WHERE id = $1`,
       [
         id,
-        dto.fibreId?.trim() ?? row.fibre_id,
+        fibreId,
         dto.cableType !== undefined ? dto.cableType?.trim() || null : row.cable_type,
         cores.length,
         cores.find((core) => core.fromCoreLabel)?.fromCoreLabel ?? null,
@@ -340,9 +349,9 @@ export class LinkService {
         dto.notes !== undefined ? dto.notes?.trim() || null : row.notes,
         JSON.stringify(path),
         lengthM,
-        dto.attenuationDbPerKm ?? row.attenuation_db_per_km ?? 0.35,
+        dto.attenuationDbPerKm ?? row.attenuation_db_per_km ?? 0.5,
         dto.spliceCount ?? row.splice_count ?? 2,
-        dto.connectionLossDb ?? row.connection_loss_db ?? 1.0,
+        dto.connectionLossDb ?? row.connection_loss_db ?? 0.2,
         dto.color !== undefined ? dto.color : row.color,
         subAreaId,
       ],
@@ -353,6 +362,8 @@ export class LinkService {
     await this.syncOnuCores(id, from, cores.map((core) => core.fromCoreLabel));
     await this.syncOnuCores(id, to, cores.map((core) => core.toCoreLabel));
     await this.syncTjUserFibres(id, from, to, cores);
+    await this.provisionOnuVlan(from);
+    await this.provisionOnuVlan(to);
 
     // When the link status changes to/from 'cut', immediately propagate the
     // down/up state to the connected device cores so they reflect it right away.
@@ -380,6 +391,9 @@ export class LinkService {
     if (to) await this.syncDeviceCores(id, to, []);
     if (from) await this.syncOnuCores(id, from, []);
     if (to) await this.syncOnuCores(id, to, []);
+    // A dropped ONU may lose its PON port — re-balance its VLAN afterwards.
+    if (from) await this.provisionOnuVlan(from);
+    if (to) await this.provisionOnuVlan(to);
     await this.removeAutoUserFibres(id);
     return { ok: true, id };
   }
@@ -458,10 +472,56 @@ export class LinkService {
     }
   }
 
+  /** Every fibre span carries its own ID network-wide; the unique index is the backstop. */
+  private async assertFibreIdAvailable(fibreId: string, excludeLinkId?: string) {
+    if (!fibreId) return;
+    const rows = await this.db.query<{
+      fibre_id: string;
+      from_code: string | null;
+      to_code: string | null;
+      district_name: string | null;
+      area_name: string | null;
+      sub_area_name: string | null;
+    }>(
+      `SELECT l.fibre_id,
+              COALESCE(f.code, fo.code, fu.username) AS from_code,
+              COALESCE(t.code, o.code, ou.username) AS to_code,
+              d.name AS district_name, a.name AS area_name, sa.name AS sub_area_name
+         FROM tj_links l
+         LEFT JOIN tjs f ON f.id = l.from_tj_id
+         LEFT JOIN olts fo ON fo.id = l.from_olt_id
+         LEFT JOIN onus fu ON fu.id = l.from_onu_id
+         LEFT JOIN tjs t ON t.id = l.to_tj_id
+         LEFT JOIN olts o ON o.id = l.to_olt_id
+         LEFT JOIN onus ou ON ou.id = l.to_onu_id
+         LEFT JOIN sub_areas sa ON sa.id = l.sub_area_id
+         LEFT JOIN areas a ON a.id = sa.area_id
+         LEFT JOIN districts d ON d.id = a.district_id
+        WHERE lower(l.fibre_id) = lower($1)
+          AND ($2::uuid IS NULL OR l.id <> $2::uuid)
+        LIMIT 1`,
+      [fibreId, excludeLinkId ?? null],
+    );
+    if (rows.length === 0) return;
+    const other = rows[0];
+    const span = [other.from_code, other.to_code].filter(Boolean).join(' ↔ ');
+    throw new BadRequestException(
+      `Fibre ID "${fibreId}" is already used by link ${other.fibre_id}${span ? ` between ${span}` : ''}${locationLabel(other)}.`,
+    );
+  }
+
+  /** An ONU takes the VLAN of the PON port serving it once its drop cable is patched in. */
+  private async provisionOnuVlan(endpoint: Endpoint) {
+    if (endpoint.kind !== 'onu') return;
+    await syncOnuPonVlan(this.db, endpoint.id);
+  }
+
   /**
-   * A span that terminates on an ONU provisions that subscriber on the PON port
-   * at the head of its chain. The port only has the ONU slots its OLT type
-   * allows, so a full port refuses the connection.
+   * A span joins devices to the PON tree. Patching a drop cable puts a
+   * subscriber on the port at the head of its chain, and linking an OLT port
+   * hands it a whole downstream branch, so the new spans are simulated first:
+   * every ONU they newly reach must match the port's PON technology and fit
+   * within its ONU limit.
    */
   private async assertPonCapacity(
     from: Endpoint,
@@ -469,10 +529,8 @@ export class LinkService {
     cores: LinkCore[],
     linkId?: string,
   ) {
-    const onuId = from.kind === 'onu' ? from.id : to.kind === 'onu' ? to.id : null;
-    if (!onuId) return;
-    await assertPonOnuCapacity(this.db, [onuId], {
-      id: linkId ?? `pending-${onuId}`,
+    await assertPonAssignment(this.db, {
+      id: linkId ?? `${from.kind}:${from.id}->${to.kind}:${to.id}`,
       fromTjId: from.kind === 'tj' ? from.id : null,
       fromOltId: from.kind === 'olt' ? from.id : null,
       fromOnuId: from.kind === 'onu' ? from.id : null,
@@ -886,7 +944,7 @@ export class LinkService {
       lengthM: row.length_m === null ? null : Number(row.length_m),
       attenuationDbPerKm:
         row.attenuation_db_per_km === null || row.attenuation_db_per_km === undefined
-          ? 0.35
+          ? 0.5
           : Number(row.attenuation_db_per_km),
       spliceCount:
         row.splice_count === null || row.splice_count === undefined
@@ -894,7 +952,7 @@ export class LinkService {
           : Number(row.splice_count),
       connectionLossDb:
         row.connection_loss_db === null || row.connection_loss_db === undefined
-          ? 1.0
+          ? 0.2
           : Number(row.connection_loss_db),
       color: row.color ?? null,
       notes: row.notes,

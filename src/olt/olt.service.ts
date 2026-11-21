@@ -2,9 +2,11 @@ import { BadRequestException, Injectable, NotFoundException } from '@nestjs/comm
 import { DatabaseService } from '../database/database.service';
 import { linksTouching, releaseDeletedLinkCores } from '../database/link-core-release';
 import { guardDuplicate } from '../database/pg-errors';
+import { assertDeviceCodeAvailable } from '../database/device-codes';
 import { resolvePlacement } from '../database/placement';
 import { CreateOltDto, ETHERNET_SPEEDS, UpdateOltDto } from './olt.dto';
 import { ponOnuCapacity, ponOnuUsage } from './pon-capacity';
+import { assertPortVlansAvailable, syncOltPonVlans } from '../onu/vlan-pool';
 
 export interface PonPort {
   label: string;
@@ -137,6 +139,12 @@ function normaliseEthernetPorts(value: unknown): EthernetPort[] {
     .filter((entry): entry is EthernetPort => entry !== null);
 }
 
+function portVlanIds(ponPorts: PonPort[], ethernetPorts: EthernetPort[]): number[] {
+  return [...ponPorts, ...ethernetPorts]
+    .map((port) => port.vlanId)
+    .filter((vlan): vlan is number => vlan !== null);
+}
+
 @Injectable()
 export class OltService {
   constructor(private readonly db: DatabaseService) {}
@@ -209,6 +217,9 @@ export class OltService {
     const oltType = dto.oltType?.trim() || 'gpon';
     const ponPorts = normalisePonPorts(dto.ponPorts);
     const ethernetPorts = normaliseEthernetPorts(dto.ethernetPorts);
+    await assertPortVlansAvailable(this.db, portVlanIds(ponPorts, ethernetPorts));
+    const oltCode = slugCode(dto.code ?? dto.name, 'OLT');
+    await assertDeviceCodeAvailable(this.db, oltCode);
     const primaryPon = dto.ponPort?.trim() || ponPorts[0]?.label || null;
     const uplinkPort =
       dto.uplinkPort?.trim() ||
@@ -223,7 +234,7 @@ export class OltService {
                  $13, $14)
          RETURNING id`,
         [
-          slugCode(dto.code ?? dto.name, 'OLT'),
+          oltCode,
           dto.name.trim(),
           oltType,
           primaryPon,
@@ -272,6 +283,10 @@ export class OltService {
       uplinkPort = ethernetPorts[0] ? `${ethernetPorts[0].label} · ${ethernetPorts[0].speed}` : null;
     else uplinkPort = existing.uplinkPort;
 
+    await assertPortVlansAvailable(this.db, portVlanIds(ponPorts, ethernetPorts), id);
+    const oltCode = dto.code ? slugCode(dto.code, existing.code) : existing.code;
+    await assertDeviceCodeAvailable(this.db, oltCode, id);
+
     const rows = await guardDuplicate(
       this.db.query<{ id: string }>(
         `UPDATE olts SET
@@ -293,7 +308,7 @@ export class OltService {
          RETURNING id`,
         [
           id,
-          dto.code ? slugCode(dto.code, existing.code) : existing.code,
+          oltCode,
           dto.name?.trim() || existing.name,
           oltType,
           primaryPon,
@@ -310,6 +325,8 @@ export class OltService {
       ),
       'An OLT with this name or code already exists.',
     );
+    // Port VLAN changes propagate to every subscriber the port serves.
+    await syncOltPonVlans(this.db, id);
     return this.get(rows[0].id);
   }
 
