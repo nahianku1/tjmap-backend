@@ -6,6 +6,7 @@ import { resolvePlacement } from '../database/placement';
 import { onuServingPort, ponOltFamily, ponOnuFamily } from '../olt/pon-capacity';
 import { assertMacAvailable, normalizeMacAddress } from './mac-address';
 import { assertVlanAvailable, syncOnuPonVlan } from './vlan-pool';
+import { shiftLinkPathsForDevice } from '../tj/link.service';
 import {
   CreateOnuDto,
   ONU_CLASSES,
@@ -222,6 +223,15 @@ export class OnuService {
       ],
     );
     await syncOnuPonVlan(this.db, rows[0].id);
+    // A moved subscriber carries its drop cable's drawn route along with it.
+    if (existing.lat != null && existing.lng != null && lat != null && lng != null) {
+      await shiftLinkPathsForDevice(
+        this.db,
+        { kind: 'onu', id },
+        lat - existing.lat,
+        lng - existing.lng,
+      );
+    }
     return this.get(rows[0].id);
   }
 

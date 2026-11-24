@@ -7,6 +7,7 @@ import { resolvePlacement } from '../database/placement';
 import { CreateOltDto, ETHERNET_SPEEDS, UpdateOltDto } from './olt.dto';
 import { ponOnuCapacity, ponOnuUsage } from './pon-capacity';
 import { assertPortVlansAvailable, syncOltPonVlans } from '../onu/vlan-pool';
+import { shiftLinkPathsForDevice } from '../tj/link.service';
 
 export interface PonPort {
   label: string;
@@ -327,6 +328,15 @@ export class OltService {
     );
     // Port VLAN changes propagate to every subscriber the port serves.
     await syncOltPonVlans(this.db, id);
+    // A moved cabinet carries its drawn fibre routes along with it.
+    if (existing.lat != null && existing.lng != null && lat != null && lng != null) {
+      await shiftLinkPathsForDevice(
+        this.db,
+        { kind: 'olt', id },
+        lat - existing.lat,
+        lng - existing.lng,
+      );
+    }
     return this.get(rows[0].id);
   }
 

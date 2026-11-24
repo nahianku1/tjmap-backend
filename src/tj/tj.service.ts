@@ -7,6 +7,7 @@ import { resolvePlacement } from '../database/placement';
 import { OltService } from '../olt/olt.service';
 import { OnuService } from '../onu/onu.service';
 import { ChangeOutputCoreDto, CreateTjDto, UpdateTjDto } from './tj.dto';
+import { shiftLinkPathsForDevice } from './link.service';
 
 interface TjRow {
   id: string;
@@ -311,6 +312,17 @@ export class TjService {
       'A terminal joint with this code already exists.',
     );
 
+    // A moved joint carries its drawn fibre routes along with it.
+    const movedLat = dto.lat ?? existing.lat;
+    const movedLng = dto.lng ?? existing.lng;
+    if (existing.lat != null && existing.lng != null && movedLat != null && movedLng != null) {
+      await shiftLinkPathsForDevice(
+        this.db,
+        { kind: 'tj', id },
+        movedLat - existing.lat,
+        movedLng - existing.lng,
+      );
+    }
     return this.get(rows[0].id);
   }
 

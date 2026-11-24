@@ -93,6 +93,12 @@ export class GeoController {
     return this.geo.removeArea(id);
   }
 
+  @Delete('areas/:id/sub-areas')
+  @Roles('admin')
+  removeSubAreas(@Param('id', ParseUUIDPipe) id: string) {
+    return this.geo.removeSubAreas(id);
+  }
+
   @Get('sub-areas')
   listSubAreas(@Query('areaId') areaId?: string) {
     return this.geo.listSubAreas(areaId);

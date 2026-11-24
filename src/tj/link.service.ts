@@ -214,6 +214,66 @@ function parseStoredCores(value: unknown): LinkCore[] {
   });
 }
 
+/**
+ * Shifts every drawn bend of the spans touching a device by the same offset
+ * the device travelled, then recomputes each span's length from the new route.
+ * Runs after the device's own coordinates are saved, so the stored geometry
+ * matches wherever the device now sits — for drags, dialog edits and API calls.
+ */
+export async function shiftLinkPathsForDevice(
+  db: DatabaseService,
+  endpoint: { kind: EndpointKind; id: string },
+  dLat: number,
+  dLng: number,
+): Promise<void> {
+  if (!Number.isFinite(dLat) || !Number.isFinite(dLng) || (dLat === 0 && dLng === 0)) return;
+  const column = `${endpoint.kind}_id`;
+  const rows = await db.query<{
+    id: string;
+    path: unknown;
+    from_lat: number | null;
+    from_lng: number | null;
+    to_lat: number | null;
+    to_lng: number | null;
+  }>(
+    `SELECT l.id, l.path,
+            ST_Y(COALESCE(f.location, fo.location, fu.location)::geometry) AS from_lat,
+            ST_X(COALESCE(f.location, fo.location, fu.location)::geometry) AS from_lng,
+            ST_Y(COALESCE(t.location, o.location, ou.location)::geometry) AS to_lat,
+            ST_X(COALESCE(t.location, o.location, ou.location)::geometry) AS to_lng
+       FROM tj_links l
+       LEFT JOIN tjs f ON f.id = l.from_tj_id
+       LEFT JOIN olts fo ON fo.id = l.from_olt_id
+       LEFT JOIN onus fu ON fu.id = l.from_onu_id
+       LEFT JOIN tjs t ON t.id = l.to_tj_id
+       LEFT JOIN olts o ON o.id = l.to_olt_id
+       LEFT JOIN onus ou ON ou.id = l.to_onu_id
+      WHERE l.from_${column} = $1 OR l.to_${column} = $1`,
+    [endpoint.id],
+  );
+
+  for (const row of rows) {
+    const path = normalisePath(row.path).map((point) => ({
+      lat: point.lat + dLat,
+      lng: point.lng + dLng,
+    }));
+    const lengthM =
+      row.from_lat !== null && row.from_lng !== null && row.to_lat !== null && row.to_lng !== null
+        ? routeLengthMeters(
+            Number(row.from_lat),
+            Number(row.from_lng),
+            Number(row.to_lat),
+            Number(row.to_lng),
+            path,
+          )
+        : null;
+    await db.query(
+      `UPDATE tj_links SET path = $2::jsonb, length_m = $3, updated_at = now() WHERE id = $1`,
+      [row.id, JSON.stringify(path), lengthM],
+    );
+  }
+}
+
 @Injectable()
 export class LinkService {
   constructor(private readonly db: DatabaseService) {}

@@ -38,15 +38,17 @@ async function oltPortVlans(db: DatabaseService): Promise<Map<number, PortVlanCa
     `SELECT (port->>'vlanId')::int AS vlan, o.id AS olt_id, o.code AS olt_code,
             'PON' AS kind, port->>'label' AS label,
             d.name AS district_name, a.name AS area_name, sa.name AS sub_area_name
-       FROM olts o, jsonb_array_elements(o.pon_ports) AS port
+       FROM olts o
        ${OLT_LOCATION_JOINS}
+       CROSS JOIN LATERAL jsonb_array_elements(o.pon_ports) AS port
       WHERE COALESCE(port->>'vlanId', '') ~ '^[0-9]{1,4}$'
         AND (port->>'vlanId')::int BETWEEN 1 AND 4094
      UNION ALL
      SELECT (port->>'vlanId')::int, o.id, o.code, 'Ethernet', port->>'label',
             d.name, a.name, sa.name
-       FROM olts o, jsonb_array_elements(o.ethernet_ports) AS port
+       FROM olts o
        ${OLT_LOCATION_JOINS}
+       CROSS JOIN LATERAL jsonb_array_elements(o.ethernet_ports) AS port
       WHERE COALESCE(port->>'vlanId', '') ~ '^[0-9]{1,4}$'
         AND (port->>'vlanId')::int BETWEEN 1 AND 4094`,
   );

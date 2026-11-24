@@ -364,7 +364,29 @@ export class GeoService {
   async removeSubArea(id: string) {
     const exists = await this.db.query<{ id: string }>('SELECT id FROM sub_areas WHERE id = $1', [id]);
     if (exists.length === 0) throw new NotFoundException('Sub-area not found');
+    return this.removeSubAreaCascade(id);
+  }
 
+  /** Deletes every sub-area filed under an area, devices and links included. */
+  async removeSubAreas(areaId: string) {
+    const area = await this.db.query<{ id: string }>('SELECT id FROM areas WHERE id = $1', [areaId]);
+    if (area.length === 0) throw new NotFoundException('Area not found');
+    const ids = (
+      await this.db.query<{ id: string }>('SELECT id FROM sub_areas WHERE area_id = $1', [areaId])
+    ).map((row) => row.id);
+
+    const removed = { tjs: 0, olts: 0, onus: 0, links: 0 };
+    for (const id of ids) {
+      const result = await this.removeSubAreaCascade(id);
+      removed.tjs += result.removed.tjs;
+      removed.olts += result.removed.olts;
+      removed.onus += result.removed.onus;
+      removed.links += result.removed.links;
+    }
+    return { ok: true, areaId, subAreas: ids.length, removed };
+  }
+
+  private async removeSubAreaCascade(id: string) {
     const tjIds = (
       await this.db.query<{ id: string }>('SELECT id FROM tjs WHERE sub_area_id = $1', [id])
     ).map((row) => row.id);
