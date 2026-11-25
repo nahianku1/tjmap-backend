@@ -9,6 +9,7 @@ import { Request } from 'express';
 import { AuthService } from './auth.service';
 import { ROLES_KEY } from './roles.decorator';
 import { Role } from './auth.types';
+import { config } from '../config';
 
 export interface AuthenticatedRequest extends Request {
   user?: { id: string; email: string; name: string; role: Role };
@@ -21,8 +22,14 @@ export class JwtAuthGuard implements CanActivate {
   async canActivate(context: ExecutionContext): Promise<boolean> {
     const request = context.switchToHttp().getRequest<AuthenticatedRequest>();
     const header = request.headers.authorization ?? '';
-    const [scheme, token] = header.split(' ');
-    if (scheme !== 'Bearer' || !token) {
+    const [scheme, bearer] = header.split(' ');
+    // The access token is also stored in an httpOnly cookie, so a browser session
+    // survives a reload even before the client holds a token in memory.
+    const token =
+      (scheme === 'Bearer' && bearer ? bearer : null) ??
+      (request.cookies as Record<string, string> | undefined)?.[config.accessCookieName] ??
+      null;
+    if (!token) {
       throw new ForbiddenException('Authentication required');
     }
     const payload = await this.auth.verifyAccessToken(token);

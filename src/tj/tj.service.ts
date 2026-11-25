@@ -181,7 +181,7 @@ export class TjService {
 
   async get(id: string) {
     const rows = await this.db.query<TjRow>(`${TJ_SELECT} WHERE t.id = $1`, [id]);
-    if (rows.length === 0) throw new NotFoundException('Terminal joint not found');
+    if (rows.length === 0) throw new NotFoundException('TJ not found');
     return this.mapTj(rows[0]);
   }
 
@@ -229,7 +229,7 @@ export class TjService {
         placement.subAreaId,
       ],
     ),
-      'A terminal joint with this code already exists.',
+      'A TJ with this code already exists.',
     );
     return this.get(rows[0].id);
   }
@@ -309,7 +309,7 @@ export class TjService {
         placement.subAreaId,
       ],
     ),
-      'A terminal joint with this code already exists.',
+      'A TJ with this code already exists.',
     );
 
     // A moved joint carries its drawn fibre routes along with it.
@@ -348,7 +348,7 @@ export class TjService {
       splitter: unknown;
       splitters: unknown;
     }>('SELECT user_fibres, output_cores, splitter, splitters FROM tjs WHERE id = $1', [id]);
-    if (rows.length === 0) throw new NotFoundException('Terminal joint not found');
+    if (rows.length === 0) throw new NotFoundException('TJ not found');
     const row = rows[0];
 
     // A joint keeps its legs in the legacy `output_cores` column, the legacy
@@ -377,9 +377,9 @@ export class TjService {
     };
 
     const source = findCore(fromLabel);
-    if (!source) throw new BadRequestException('That output core is not on this joint.');
+    if (!source) throw new BadRequestException('That output core is not on this TJ.');
     const target = findCore(toLabel);
-    if (!target) throw new BadRequestException('Pick another output core of this joint.');
+    if (!target) throw new BadRequestException('Pick another output core of this TJ.');
 
     if (
       String(target.status ?? 'free') !== 'free' ||
@@ -508,7 +508,7 @@ export class TjService {
   async remove(id: string) {
     const links = await linksTouching(this.db, 'tj', id);
     const rows = await this.db.query<{ id: string }>('DELETE FROM tjs WHERE id = $1 RETURNING id', [id]);
-    if (rows.length === 0) throw new NotFoundException('Terminal joint not found');
+    if (rows.length === 0) throw new NotFoundException('TJ not found');
     await releaseDeletedLinkCores(this.db, links, id);
     return { ok: true, id };
   }

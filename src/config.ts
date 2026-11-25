@@ -41,4 +41,5 @@ export const config = {
   cookieSameSite: sameSite(),
   isProd: process.env.NODE_ENV === 'production',
   refreshCookieName: 'isp_tj_refresh',
+  accessCookieName: 'isp_tj_access',
 };

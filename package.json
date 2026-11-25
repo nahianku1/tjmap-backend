@@ -2,7 +2,7 @@
   "name": "isp-tj-backend",
   "version": "1.0.0",
   "private": true,
-  "description": "REST API for the ISP FTTH terminal joint monitoring platform",
+  "description": "REST API for the ISP FTTH TJ monitoring platform",
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
     "start": "node dist/main.js",

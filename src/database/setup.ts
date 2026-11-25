@@ -630,9 +630,9 @@ async function main() {
         [fromId, toId, link.fibreId, link.cableType, link.coreCount, link.fromCoreLabel ?? null, link.toCoreLabel ?? null, link.status ?? 'active', adminId ?? null],
       );
     }
-    console.log(`✓ seeded ${TJ_SEED.length} terminal joints and ${LINK_SEED.length} fibre links`);
+    console.log(`✓ seeded ${TJ_SEED.length} TJs and ${LINK_SEED.length} links`);
   } else {
-    console.log(`✓ ${tjCount.rows[0].count} terminal joints already present, skipping seed`);
+    console.log(`✓ ${tjCount.rows[0].count} TJs already present, skipping seed`);
   }
 
   await seedGeography(adminId);

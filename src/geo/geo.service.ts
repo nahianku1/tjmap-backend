@@ -18,8 +18,12 @@ interface DistrictRow {
   name: string;
   description: string | null;
   area_count: number;
+  sub_area_count: number;
   tj_count: number;
+  olt_count: number;
+  onu_count: number;
   cut_count: number;
+  cut_link_count: number;
   link_count: number;
   min_lat: number | null;
   max_lat: number | null;
@@ -37,8 +41,12 @@ interface AreaRow {
   code: string | null;
   name: string;
   description: string | null;
+  sub_area_count: number;
   tj_count: number;
+  olt_count: number;
+  onu_count: number;
   cut_count: number;
+  cut_link_count: number;
   link_count: number;
   min_lat: number | null;
   max_lat: number | null;
@@ -65,26 +73,54 @@ interface SubAreaRow {
   updated_at: Date;
 }
 
+const LINK_ENDPOINT_JOINS = `
+  LEFT JOIN tjs ft ON ft.id = l.from_tj_id
+  LEFT JOIN tjs tt ON tt.id = l.to_tj_id
+  LEFT JOIN olts fo ON fo.id = l.from_olt_id
+  LEFT JOIN olts oto ON oto.id = l.to_olt_id
+  LEFT JOIN onus fu ON fu.id = l.from_onu_id
+  LEFT JOIN onus tuo ON tuo.id = l.to_onu_id
+  LEFT JOIN areas fta ON fta.id = ft.area_id
+  LEFT JOIN areas tta ON tta.id = tt.area_id
+  LEFT JOIN areas foa ON foa.id = fo.area_id
+  LEFT JOIN areas toa ON toa.id = oto.area_id
+  LEFT JOIN areas fua ON fua.id = fu.area_id
+  LEFT JOIN areas tua ON tua.id = tuo.area_id
+`;
+
+function linkCountSql(scope: 'district' | 'area', cutOnly = false): string {
+  const matches =
+    scope === 'district'
+      ? 'd.id IN (fta.district_id, tta.district_id, foa.district_id, toa.district_id, fua.district_id, tua.district_id)'
+      : 'a.id IN (ft.area_id, tt.area_id, fo.area_id, oto.area_id, fu.area_id, tuo.area_id)';
+  return `(SELECT count(DISTINCT l.id) FROM tj_links l ${LINK_ENDPOINT_JOINS}
+            WHERE ${cutOnly ? "l.status = 'cut' AND " : ''}${matches})::int`;
+}
+
 const DISTRICT_SELECT = `
   SELECT d.id, d.code, d.name, d.description, d.created_at, d.updated_at,
          COALESCE(s.area_count, 0) AS area_count,
+         COALESCE(s.sub_area_count, 0) AS sub_area_count,
          COALESCE(s.tj_count, 0) AS tj_count,
+         COALESCE(s.olt_count, 0) AS olt_count,
+         COALESCE(s.onu_count, 0) AS onu_count,
          COALESCE(s.cut_count, 0) AS cut_count,
+         COALESCE(s.cut_link_count, 0) AS cut_link_count,
          COALESCE(s.link_count, 0) AS link_count,
          s.min_lat, s.max_lat, s.min_lng, s.max_lng
   FROM districts d
   LEFT JOIN LATERAL (
     SELECT
       (SELECT count(*) FROM areas a WHERE a.district_id = d.id)::int AS area_count,
+      (SELECT count(*) FROM sub_areas sa JOIN areas a ON a.id = sa.area_id
+        WHERE a.district_id = d.id)::int AS sub_area_count,
       (SELECT count(*) FROM tjs t JOIN areas a ON a.id = t.area_id WHERE a.district_id = d.id)::int AS tj_count,
+      (SELECT count(*) FROM olts o JOIN areas a ON a.id = o.area_id WHERE a.district_id = d.id)::int AS olt_count,
+      (SELECT count(*) FROM onus n JOIN areas a ON a.id = n.area_id WHERE a.district_id = d.id)::int AS onu_count,
       (SELECT count(*) FROM tjs t JOIN areas a ON a.id = t.area_id
         WHERE a.district_id = d.id AND t.is_cut)::int AS cut_count,
-      (SELECT count(*) FROM tj_links l
-         JOIN tjs f ON f.id = l.from_tj_id
-         JOIN tjs t ON t.id = l.to_tj_id
-         JOIN areas fa ON fa.id = f.area_id
-         JOIN areas ta ON ta.id = t.area_id
-        WHERE fa.district_id = d.id OR ta.district_id = d.id)::int AS link_count,
+      ${linkCountSql('district', true)} AS cut_link_count,
+      ${linkCountSql('district')} AS link_count,
       (SELECT min(ST_Y(t.location::geometry)) FROM tjs t JOIN areas a ON a.id = t.area_id
         WHERE a.district_id = d.id) AS min_lat,
       (SELECT max(ST_Y(t.location::geometry)) FROM tjs t JOIN areas a ON a.id = t.area_id
@@ -99,20 +135,25 @@ const DISTRICT_SELECT = `
 const AREA_SELECT = `
   SELECT a.id, a.district_id, a.code, a.name, a.description, a.created_at, a.updated_at,
          d.code AS district_code, d.name AS district_name,
+         COALESCE(s.sub_area_count, 0) AS sub_area_count,
          COALESCE(s.tj_count, 0) AS tj_count,
+         COALESCE(s.olt_count, 0) AS olt_count,
+         COALESCE(s.onu_count, 0) AS onu_count,
          COALESCE(s.cut_count, 0) AS cut_count,
+         COALESCE(s.cut_link_count, 0) AS cut_link_count,
          COALESCE(s.link_count, 0) AS link_count,
          s.min_lat, s.max_lat, s.min_lng, s.max_lng
   FROM areas a
   JOIN districts d ON d.id = a.district_id
   LEFT JOIN LATERAL (
     SELECT
+      (SELECT count(*) FROM sub_areas s WHERE s.area_id = a.id)::int AS sub_area_count,
       (SELECT count(*) FROM tjs t WHERE t.area_id = a.id)::int AS tj_count,
+      (SELECT count(*) FROM olts o WHERE o.area_id = a.id)::int AS olt_count,
+      (SELECT count(*) FROM onus n WHERE n.area_id = a.id)::int AS onu_count,
       (SELECT count(*) FROM tjs t WHERE t.area_id = a.id AND t.is_cut)::int AS cut_count,
-      (SELECT count(*) FROM tj_links l
-         JOIN tjs f ON f.id = l.from_tj_id
-         JOIN tjs t ON t.id = l.to_tj_id
-        WHERE f.area_id = a.id OR t.area_id = a.id)::int AS link_count,
+      ${linkCountSql('area', true)} AS cut_link_count,
+      ${linkCountSql('area')} AS link_count,
       (SELECT min(ST_Y(t.location::geometry)) FROM tjs t WHERE t.area_id = a.id) AS min_lat,
       (SELECT max(ST_Y(t.location::geometry)) FROM tjs t WHERE t.area_id = a.id) AS max_lat,
       (SELECT min(ST_X(t.location::geometry)) FROM tjs t WHERE t.area_id = a.id) AS min_lng,
@@ -139,7 +180,8 @@ const SUB_AREA_SELECT = `
   ) c ON true
 `;
 
-/** Camera fit for a bounding box: keeps the whole set inside ~60% of the viewport. */export function boundsZoom(
+/** Camera fit for a bounding box: keeps the whole set inside ~60% of the viewport. */
+export function boundsZoom(
   minLat: number | null,
   maxLat: number | null,
   minLng: number | null,
@@ -452,8 +494,12 @@ export class GeoService {
       zoom: bounds ? boundsZoom(bounds.minLat, bounds.maxLat, bounds.minLng, bounds.maxLng) : null,
       bounds,
       areaCount: Number(row.area_count),
+      subAreaCount: Number(row.sub_area_count),
       tjCount: Number(row.tj_count),
+      oltCount: Number(row.olt_count),
+      onuCount: Number(row.onu_count),
       cutCount: Number(row.cut_count),
+      cutLinkCount: Number(row.cut_link_count),
       linkCount: Number(row.link_count),
       createdAt: new Date(row.created_at).toISOString(),
       updatedAt: new Date(row.updated_at).toISOString(),
@@ -474,8 +520,12 @@ export class GeoService {
       lng: bounds ? (bounds.minLng + bounds.maxLng) / 2 : null,
       zoom: bounds ? boundsZoom(bounds.minLat, bounds.maxLat, bounds.minLng, bounds.maxLng) : null,
       bounds,
+      subAreaCount: Number(row.sub_area_count),
       tjCount: Number(row.tj_count),
+      oltCount: Number(row.olt_count),
+      onuCount: Number(row.onu_count),
       cutCount: Number(row.cut_count),
+      cutLinkCount: Number(row.cut_link_count),
       linkCount: Number(row.link_count),
       createdAt: new Date(row.created_at).toISOString(),
       updatedAt: new Date(row.updated_at).toISOString(),

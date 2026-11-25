@@ -22,7 +22,7 @@ export class AuthController {
   @Post('signup')
   async signup(@Body() dto: SignupDto, @Res({ passthrough: true }) res: Response) {
     const session = await this.auth.signup(dto);
-    this.setRefreshCookie(res, session.refreshToken);
+    this.setSessionCookies(res, session);
     return { accessToken: session.accessToken, expiresIn: session.accessExpiresIn, user: session.user };
   }
 
@@ -30,7 +30,7 @@ export class AuthController {
   @HttpCode(200)
   async login(@Body() dto: LoginDto, @Res({ passthrough: true }) res: Response) {
     const session = await this.auth.login(dto);
-    this.setRefreshCookie(res, session.refreshToken);
+    this.setSessionCookies(res, session);
     return { accessToken: session.accessToken, expiresIn: session.accessExpiresIn, user: session.user };
   }
 
@@ -46,7 +46,7 @@ export class AuthController {
       throw new UnauthorizedException('No active session');
     }
     const session = await this.auth.rotateRefreshToken(token);
-    this.setRefreshCookie(res, session.refreshToken);
+    this.setSessionCookies(res, session);
     return { accessToken: session.accessToken, expiresIn: session.accessExpiresIn, user: session.user };
   }
 
@@ -55,6 +55,7 @@ export class AuthController {
   async logout(@Req() req: Request, @Res({ passthrough: true }) res: Response) {
     await this.auth.logout(req.cookies?.[config.refreshCookieName]);
     res.clearCookie(config.refreshCookieName, this.cookieOptions());
+    res.clearCookie(config.accessCookieName, this.cookieOptions());
     return { ok: true };
   }
 
@@ -62,6 +63,19 @@ export class AuthController {
   @UseGuards(JwtAuthGuard)
   async me(@Req() req: AuthenticatedRequest) {
     return this.auth.me(req.user!.id);
+  }
+
+  /** Both tokens live in httpOnly cookies: the access one expires with its JWT, the
+   *  refresh one lives for the session. */
+  private setSessionCookies(
+    res: Response,
+    session: { accessToken: string; refreshToken: string; accessExpiresIn: number },
+  ): void {
+    res.cookie(config.accessCookieName, session.accessToken, {
+      ...this.cookieOptions(),
+      maxAge: session.accessExpiresIn * 1000,
+    });
+    this.setRefreshCookie(res, session.refreshToken);
   }
 
   private setRefreshCookie(res: Response, token: string): void {

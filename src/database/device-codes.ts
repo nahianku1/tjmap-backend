@@ -4,7 +4,7 @@ import type { DatabaseService } from './database.service';
 export type DeviceKind = 'tj' | 'olt' | 'onu';
 
 const KIND_LABEL: Record<DeviceKind, string> = {
-  tj: 'terminal joint',
+  tj: 'TJ',
   olt: 'OLT',
   onu: 'ONU',
 };

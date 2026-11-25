@@ -467,7 +467,7 @@ export class LinkService {
     const chosen = [tjId, oltId, onuId].filter(Boolean).length;
     if (chosen !== 1) {
       throw new BadRequestException(
-        `Pick one ${side} device: a terminal joint, an OLT or an ONU.`,
+        `Pick one ${side} device: a TJ, an OLT or an ONU.`,
       );
     }
     const endpoint = tjId
