@@ -567,13 +567,13 @@ async function main() {
   let adminId: string | undefined;
 
   if (Number(userCount.rows[0].count) === 0) {
-    const adminHash = await hash('Admin@12345', { memoryCost: 19456, timeCost: 2, parallelism: 1 });
+    const adminHash = await hash('Admin123', { memoryCost: 19456, timeCost: 2, parallelism: 1 });
     const userHash = await hash('User@12345', { memoryCost: 19456, timeCost: 2, parallelism: 1 });
 
     const admin = await pool.query<{ id: string }>(
       `INSERT INTO users (name, email, mobile, password_hash, role)
        VALUES ($1, $2, $3, $4, 'admin') RETURNING id`,
-      ['Nafis Rahman', 'admin@isptj.app', '+8801700000001', adminHash],
+      ['Nafis Rahman', 'himelku1@gmail.com', '+8801700000001', adminHash],
     );
     adminId = admin.rows[0].id;
 
@@ -588,6 +588,22 @@ async function main() {
       "SELECT id FROM users WHERE role = 'admin' ORDER BY created_at ASC LIMIT 1",
     );
     adminId = admin.rows[0]?.id;
+  }
+
+  // Ensure the demo admin login exists on databases seeded before the rename.
+  const demoAdmin = await pool.query<{ id: string }>(
+    'SELECT id FROM users WHERE lower(email) = $1',
+    ['himelku1@gmail.com'],
+  );
+  if (demoAdmin.rows.length === 0) {
+    const adminHash = await hash('Admin123', { memoryCost: 19456, timeCost: 2, parallelism: 1 });
+    const created = await pool.query<{ id: string }>(
+      `INSERT INTO users (name, email, mobile, password_hash, role)
+       VALUES ($1, $2, $3, $4, 'admin') RETURNING id`,
+      ['Himel', 'himelku1@gmail.com', '+8801700000001', adminHash],
+    );
+    adminId ??= created.rows[0].id;
+    console.log('✓ ensured demo admin account');
   }
 
   const tjCount = await pool.query<{ count: string }>('SELECT count(*) FROM tjs');
