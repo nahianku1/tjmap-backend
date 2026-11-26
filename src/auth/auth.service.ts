@@ -8,7 +8,14 @@ import { hash, verify } from '@node-rs/argon2';
 import { createHash, randomUUID } from 'crypto';
 import { DatabaseService } from '../database/database.service';
 import { config } from '../config';
-import { LoginDto, SignupDto } from './auth.dto';
+import {
+  ChangePasswordDto,
+  CreateUserDto,
+  LoginDto,
+  ResetPasswordDto,
+  UpdateProfileDto,
+  UpdateUserDto,
+} from './auth.dto';
 import { AccessPayload, PublicUser, RefreshPayload, UserRecord } from './auth.types';
 
 const ARGON2_OPTIONS = {
@@ -28,7 +35,65 @@ export class AuthService {
     private readonly jwt: JwtService,
   ) {}
 
-  async signup(dto: SignupDto) {
+  async updateProfile(userId: string, dto: UpdateProfileDto): Promise<PublicUser> {
+    const rows = await this.db.query<UserRecord>('SELECT * FROM users WHERE id = $1', [userId]);
+    const user = rows[0];
+    if (!user) {
+      throw new UnauthorizedException('Account no longer available');
+    }
+
+    const name = dto.name?.trim() ?? user.name;
+    const email = dto.email?.trim().toLowerCase() ?? user.email;
+    const mobile = dto.mobile?.trim() ?? user.mobile;
+
+    if (email !== user.email) {
+      const existing = await this.db.query<{ id: string }>(
+        'SELECT id FROM users WHERE lower(email) = $1 AND id <> $2',
+        [email, userId],
+      );
+      if (existing.length > 0) {
+        throw new ConflictException('An account with this email already exists');
+      }
+    }
+
+    const updated = await this.db.query<UserRecord>(
+      'UPDATE users SET name = $2, email = $3, mobile = $4, updated_at = now() WHERE id = $1 RETURNING *',
+      [userId, name, email, mobile],
+    );
+    return this.toPublicUser(updated[0]);
+  }
+
+  async changePassword(userId: string, dto: ChangePasswordDto): Promise<void> {
+    const rows = await this.db.query<UserRecord>('SELECT * FROM users WHERE id = $1', [userId]);
+    const user = rows[0];
+    if (!user) {
+      throw new UnauthorizedException('Account no longer available');
+    }
+    const valid = await verify(user.password_hash, dto.currentPassword).catch(() => false);
+    if (!valid) {
+      throw new UnauthorizedException('Current password is incorrect');
+    }
+
+    const passwordHash = await hash(dto.newPassword, ARGON2_OPTIONS);
+    await this.db.query('UPDATE users SET password_hash = $2, updated_at = now() WHERE id = $1', [
+      userId,
+      passwordHash,
+    ]);
+    // A password change invalidates every session, including this one.
+    await this.db.query(
+      'UPDATE refresh_tokens SET revoked_at = now() WHERE user_id = $1 AND revoked_at IS NULL',
+      [userId],
+    );
+  }
+
+  async listUsers(): Promise<PublicUser[]> {
+    const rows = await this.db.query<UserRecord>(
+      'SELECT * FROM users ORDER BY created_at ASC',
+    );
+    return rows.map((row) => this.toPublicUser(row));
+  }
+
+  async createUser(dto: CreateUserDto): Promise<PublicUser> {
     const email = dto.email.trim().toLowerCase();
     const existing = await this.db.query<{ id: string }>(
       'SELECT id FROM users WHERE lower(email) = $1',
@@ -45,8 +110,116 @@ export class AuthService {
        RETURNING *`,
       [dto.name.trim(), email, dto.mobile.trim(), passwordHash, dto.role],
     );
+    return this.toPublicUser(rows[0]);
+  }
 
-    return this.issueSession(rows[0]);
+  async updateUser(actorId: string, userId: string, dto: UpdateUserDto): Promise<PublicUser> {
+    if (userId === actorId) {
+      throw new ConflictException('You cannot change your own role or block your own account');
+    }
+
+    const rows = await this.db.query<UserRecord>('SELECT * FROM users WHERE id = $1', [userId]);
+    const target = rows[0];
+    if (!target) {
+      throw new UnauthorizedException('Account no longer available');
+    }
+
+    const nextRole = dto.role ?? target.role;
+    const nextBlocked = dto.blocked ?? Boolean(target.blocked_at);
+    const nextName = dto.name?.trim() ?? target.name;
+    const nextEmail = dto.email?.trim().toLowerCase() ?? target.email;
+    const nextMobile = dto.mobile?.trim() ?? target.mobile;
+
+    const wasActiveAdmin = target.role === 'admin' && !target.blocked_at;
+    const willBeActiveAdmin = nextRole === 'admin' && !nextBlocked;
+
+    if (wasActiveAdmin && !willBeActiveAdmin) {
+      const admins = await this.db.query<{ count: string }>(
+        `SELECT count(*)::text AS count FROM users
+         WHERE role = 'admin' AND blocked_at IS NULL AND id <> $1`,
+        [userId],
+      );
+      if (Number(admins[0]?.count ?? 0) === 0) {
+        throw new ConflictException('At least one active admin account must remain');
+      }
+    }
+
+    if (nextEmail !== target.email) {
+      const existing = await this.db.query<{ id: string }>(
+        'SELECT id FROM users WHERE lower(email) = $1 AND id <> $2',
+        [nextEmail, userId],
+      );
+      if (existing.length > 0) {
+        throw new ConflictException('An account with this email already exists');
+      }
+    }
+
+    const updated = await this.db.query<UserRecord>(
+      `UPDATE users
+       SET name = $2,
+           email = $3,
+           mobile = $4,
+           role = $5,
+           blocked_at = CASE WHEN $6 THEN COALESCE(blocked_at, now()) ELSE NULL END,
+           updated_at = now()
+       WHERE id = $1
+       RETURNING *`,
+      [userId, nextName, nextEmail, nextMobile, nextRole, nextBlocked],
+    );
+
+    // Role, block and email changes take effect immediately: kill every session
+    // so the next login issues a token with the new role (or none at all).
+    await this.db.query(
+      'UPDATE refresh_tokens SET revoked_at = now() WHERE user_id = $1 AND revoked_at IS NULL',
+      [userId],
+    );
+
+    return this.toPublicUser(updated[0]);
+  }
+
+  async resetUserPassword(actorId: string, userId: string, dto: ResetPasswordDto): Promise<void> {
+    if (userId === actorId) {
+      throw new ConflictException('Use the change-password form to update your own password');
+    }
+    const rows = await this.db.query<UserRecord>('SELECT id FROM users WHERE id = $1', [userId]);
+    if (rows.length === 0) {
+      throw new UnauthorizedException('Account no longer available');
+    }
+
+    const passwordHash = await hash(dto.newPassword, ARGON2_OPTIONS);
+    await this.db.query('UPDATE users SET password_hash = $2, updated_at = now() WHERE id = $1', [
+      userId,
+      passwordHash,
+    ]);
+    await this.db.query(
+      'UPDATE refresh_tokens SET revoked_at = now() WHERE user_id = $1 AND revoked_at IS NULL',
+      [userId],
+    );
+  }
+
+  async deleteUser(actorId: string, userId: string): Promise<void> {
+    if (userId === actorId) {
+      throw new ConflictException('You cannot delete your own account');
+    }
+
+    const rows = await this.db.query<UserRecord>('SELECT * FROM users WHERE id = $1', [userId]);
+    const target = rows[0];
+    if (!target) {
+      throw new UnauthorizedException('Account no longer available');
+    }
+
+    if (target.role === 'admin' && !target.blocked_at) {
+      const admins = await this.db.query<{ count: string }>(
+        `SELECT count(*)::text AS count FROM users
+         WHERE role = 'admin' AND blocked_at IS NULL AND id <> $1`,
+        [userId],
+      );
+      if (Number(admins[0]?.count ?? 0) === 0) {
+        throw new ConflictException('At least one active admin account must remain');
+      }
+    }
+
+    await this.db.query('DELETE FROM users WHERE id = $1', [userId]);
   }
 
   async login(dto: LoginDto) {
@@ -57,6 +230,9 @@ export class AuthService {
     const user = rows[0];
     if (!user) {
       throw new UnauthorizedException('Invalid email or password');
+    }
+    if (user.blocked_at) {
+      throw new UnauthorizedException('This account has been blocked. Contact an administrator.');
     }
     const valid = await verify(user.password_hash, dto.password).catch(() => false);
     if (!valid) {
@@ -107,7 +283,7 @@ export class AuthService {
     const users = await this.db.query<UserRecord>('SELECT * FROM users WHERE id = $1', [
       payload.sub,
     ]);
-    if (users.length === 0) {
+    if (users.length === 0 || users[0].blocked_at) {
       throw new UnauthorizedException('Account no longer available');
     }
 
@@ -125,7 +301,7 @@ export class AuthService {
 
   async me(userId: string): Promise<PublicUser> {
     const rows = await this.db.query<UserRecord>('SELECT * FROM users WHERE id = $1', [userId]);
-    if (rows.length === 0) {
+    if (rows.length === 0 || rows[0].blocked_at) {
       throw new UnauthorizedException('Account no longer available');
     }
     return this.toPublicUser(rows[0]);
@@ -196,6 +372,7 @@ export class AuthService {
       email: user.email,
       mobile: user.mobile,
       role: user.role,
+      blocked: Boolean(user.blocked_at),
       createdAt: new Date(user.created_at).toISOString(),
     };
   }

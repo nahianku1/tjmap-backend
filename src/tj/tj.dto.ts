@@ -27,8 +27,12 @@ export class CoreDto {
   @MaxLength(40)
   label: string;
 
+  // Splitter feed strands carry no colour of their own and store '' — that
+  // sentinel is allowed, but anything else must be a real hex value.
+  @IsOptional()
+  @ValidateIf((_object, value) => value !== '')
   @Matches(HEX_COLOR, { message: 'Core colour must be a hex value like #22d3ee' })
-  color: string;
+  color?: string;
 
   @Type(() => Number)
   @IsInt()

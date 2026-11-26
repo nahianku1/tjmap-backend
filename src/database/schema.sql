@@ -16,6 +16,7 @@ CREATE TABLE IF NOT EXISTS users (
   mobile        text NOT NULL,
   password_hash text NOT NULL,
   role          user_role NOT NULL DEFAULT 'user',
+  blocked_at    timestamptz,
   created_at    timestamptz NOT NULL DEFAULT now(),
   updated_at    timestamptz NOT NULL DEFAULT now()
 );

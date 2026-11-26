@@ -18,6 +18,9 @@ export class DatabaseService implements OnModuleInit, OnModuleDestroy {
     this.logger.log(`Connected to ${rows[0]?.version?.split(' ').slice(0, 2).join(' ')}`);
 
     await this.pool.query(`
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS blocked_at timestamptz;
+      CREATE INDEX IF NOT EXISTS users_blocked_idx ON users (blocked_at) WHERE blocked_at IS NOT NULL;
+
       -- Sub-areas split a service area into placement zones for devices and links.
       CREATE TABLE IF NOT EXISTS sub_areas (
         id          uuid PRIMARY KEY DEFAULT gen_random_uuid(),

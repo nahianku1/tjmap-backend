@@ -7,6 +7,7 @@ export interface UserRecord {
   mobile: string;
   password_hash: string;
   role: Role;
+  blocked_at: Date | null;
   created_at: Date;
   updated_at: Date;
 }
@@ -17,6 +18,7 @@ export interface PublicUser {
   email: string;
   mobile: string;
   role: Role;
+  blocked: boolean;
   createdAt: string;
 }
 

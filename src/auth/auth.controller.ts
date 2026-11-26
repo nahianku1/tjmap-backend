@@ -1,8 +1,12 @@
 import {
   Body,
   Controller,
+  Delete,
   Get,
   HttpCode,
+  Param,
+  ParseUUIDPipe,
+  Patch,
   Post,
   Req,
   Res,
@@ -11,19 +15,82 @@ import {
 } from '@nestjs/common';
 import { Request, Response } from 'express';
 import { AuthService } from './auth.service';
-import { LoginDto, RefreshDto, SignupDto } from './auth.dto';
-import { JwtAuthGuard, AuthenticatedRequest } from './auth.guard';
+import {
+  ChangePasswordDto,
+  CreateUserDto,
+  LoginDto,
+  RefreshDto,
+  ResetPasswordDto,
+  UpdateProfileDto,
+  UpdateUserDto,
+} from './auth.dto';
+import { AuthenticatedRequest, JwtAuthGuard, RolesGuard } from './auth.guard';
+import { Roles } from './roles.decorator';
 import { config } from '../config';
 
 @Controller('auth')
 export class AuthController {
   constructor(private readonly auth: AuthService) {}
 
-  @Post('signup')
-  async signup(@Body() dto: SignupDto, @Res({ passthrough: true }) res: Response) {
-    const session = await this.auth.signup(dto);
-    this.setSessionCookies(res, session);
-    return { accessToken: session.accessToken, expiresIn: session.accessExpiresIn, user: session.user };
+  @Patch('me')
+  @UseGuards(JwtAuthGuard)
+  async updateMe(@Req() req: AuthenticatedRequest, @Body() dto: UpdateProfileDto) {
+    return this.auth.updateProfile(req.user!.id, dto);
+  }
+
+  @Post('me/password')
+  @HttpCode(200)
+  @UseGuards(JwtAuthGuard)
+  async changePassword(@Req() req: AuthenticatedRequest, @Body() dto: ChangePasswordDto) {
+    await this.auth.changePassword(req.user!.id, dto);
+    return { ok: true };
+  }
+
+  @Get('users')
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles('admin')
+  async listUsers() {
+    return this.auth.listUsers();
+  }
+
+  @Post('users')
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles('admin')
+  async createUser(@Body() dto: CreateUserDto) {
+    return this.auth.createUser(dto);
+  }
+
+  @Patch('users/:id')
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles('admin')
+  async updateUser(
+    @Req() req: AuthenticatedRequest,
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() dto: UpdateUserDto,
+  ) {
+    return this.auth.updateUser(req.user!.id, id, dto);
+  }
+
+  @Delete('users/:id')
+  @HttpCode(200)
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles('admin')
+  async deleteUser(@Req() req: AuthenticatedRequest, @Param('id', ParseUUIDPipe) id: string) {
+    await this.auth.deleteUser(req.user!.id, id);
+    return { ok: true };
+  }
+
+  @Post('users/:id/password')
+  @HttpCode(200)
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles('admin')
+  async resetUserPassword(
+    @Req() req: AuthenticatedRequest,
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() dto: ResetPasswordDto,
+  ) {
+    await this.auth.resetUserPassword(req.user!.id, id, dto);
+    return { ok: true };
   }
 
   @Post('login')

@@ -18,8 +18,13 @@ function normaliseDbUrl(raw: string): string {
 }
 
 function sameSite(): 'lax' | 'strict' | 'none' {
-  const value = (process.env.COOKIE_SAME_SITE ?? 'lax').toLowerCase();
-  return value === 'none' || value === 'strict' ? value : 'lax';
+  const value = (process.env.COOKIE_SAME_SITE ?? '').trim().toLowerCase();
+  if (value === 'none' || value === 'strict' || value === 'lax') return value;
+  // A deployed frontend and API usually live on different sites (for example
+  // fibreatlas.vercel.app and tjmap-backend.vercel.app), and a Lax cookie is
+  // dropped on such cross-site responses. None + Secure is the only policy that
+  // survives that, so it is the production default.
+  return process.env.NODE_ENV === 'production' ? 'none' : 'lax';
 }
 
 const parsedPort = Number(process.env.PORT);
